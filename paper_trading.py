@@ -1,10 +1,6 @@
 """
-paper_trading.py — Auto paper trading engine v2
-Fixes:
-  1. Auto sell after 5 days (time limit)
-  2. Pause buying when BTC drops 5%+
-  3. 24h re-entry prevention per coin
-  4. All numpy types cleaned for JSON safety
+paper_trading.py — Auto paper trading engine v3
+NEW: Trailing stop loss + Profit lock levels
 """
 
 import json
@@ -16,15 +12,25 @@ from typing import Optional
 
 PAPER_FILE       = "paper_trades.json"
 STARTING_BALANCE = 20000.0
-MAX_PER_TRADE    = 0.10       # 10% of portfolio
+MAX_PER_TRADE    = 0.10
 MAX_OPEN_TRADES  = 5
-MIN_CONFIDENCE   = 80
-TAKE_PROFIT_PCT  = 0.06      # +8%
-STOP_LOSS_PCT    = 0.03       # -4%
+MIN_CONFIDENCE   = 85        # raised from 80 to 85
+TAKE_PROFIT_PCT  = 0.06
+STOP_LOSS_PCT    = 0.03
 MAX_HOLD_DAYS    = 2.5
-REENTRY_HOURS    = 24         # FIX 3: no re-buy within 24h
-CHECK_INTERVAL   = 60         # check prices every 60s
-BINANCE_REST     = "https://api.binance.com/api/v3"
+REENTRY_HOURS    = 24
+CHECK_INTERVAL   = 60
+TRAILING_PCT     = 0.05      # 5% trailing stop
+
+# Profit lock levels
+# When profit hits X% → move stop to Y%
+PROFIT_LOCKS = [
+    (0.30, 0.00),   # at +30% → stop moves to breakeven
+    (0.50, 0.20),   # at +50% → stop moves to +20%
+    (0.80, 0.50),   # at +80% → stop moves to +50%
+]
+
+BINANCE_REST = "https://api.binance.com/api/v3"
 
 
 def _load() -> dict:
@@ -44,7 +50,7 @@ def _default_state() -> dict:
         "closed_trades":  [],
         "total_profit":   0.0,
         "auto_enabled":   True,
-        "recent_symbols": {},   # FIX 3: symbol -> last_closed_ts
+        "recent_symbols": {},
         "created_at":     int(time.time() * 1000),
         "last_updated":   int(time.time() * 1000),
     }
@@ -66,7 +72,7 @@ def _portfolio_value(state: dict) -> float:
 
 
 def _total_return_pct(state: dict) -> float:
-    val = _portfolio_value(state)
+    val      = _portfolio_value(state)
     starting = float(state["starting"])
     return round((val - starting) / starting * 100, 2) if starting > 0 else 0.0
 
@@ -89,7 +95,6 @@ def reset_portfolio() -> dict:
 
 
 async def get_btc_change() -> float:
-    """Get BTC 24h change to check market condition."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(f"{BINANCE_REST}/ticker/24hr?symbol=BTCUSDT")
@@ -111,51 +116,70 @@ async def get_live_price(symbol: str) -> Optional[float]:
     return None
 
 
+def _calc_trailing_stop(trade: dict, current_price: float) -> float:
+    """
+    Calculate trailing stop price.
+    Trails 5% below the highest price seen.
+    Also applies profit lock levels.
+    """
+    entry      = float(trade["entry_price"])
+    peak       = float(trade.get("peak_price", current_price))
+    invested   = float(trade["invested"])
+
+    # Update peak if current price is higher
+    if current_price > peak:
+        peak = current_price
+
+    # Trailing stop = 5% below peak
+    trailing_stop = round(peak * (1 - TRAILING_PCT), 8)
+
+    # Check profit lock levels
+    current_profit_pct = (current_price - entry) / entry
+
+    locked_stop = float(trade.get("stop_price", entry * (1 - STOP_LOSS_PCT)))
+
+    for profit_threshold, stop_level in sorted(PROFIT_LOCKS, reverse=True):
+        if current_profit_pct >= profit_threshold:
+            # Stop must be at least at this level
+            lock_price = round(entry * (1 + stop_level), 8)
+            locked_stop = max(locked_stop, lock_price)
+            break
+
+    # Final stop = highest of trailing and locked
+    final_stop = max(trailing_stop, locked_stop)
+
+    return round(final_stop, 8), round(peak, 8)
+
+
 def auto_buy(signal: dict) -> Optional[dict]:
-    """
-    Called when scanner finds a STRONG_BUY signal.
-    Returns trade dict if bought, None if skipped.
-    """
     state = _load()
 
-    if not state.get("auto_enabled"):
-        return None
-    if str(signal.get("verdict", "")) != "STRONG_BUY":
-        return None
-    if float(signal.get("confidence", 0)) < MIN_CONFIDENCE:
-        return None
+    if not state.get("auto_enabled"):           return None
+    if str(signal.get("verdict","")) != "STRONG_BUY": return None
+    if float(signal.get("confidence", 0)) < MIN_CONFIDENCE: return None
 
     symbol = signal["symbol"]
 
-    # Check already open
     symbols_open = [t["symbol"] for t in state["open_trades"]]
-    if symbol in symbols_open:
-        return None
+    if symbol in symbols_open: return None
+    if len(state["open_trades"]) >= MAX_OPEN_TRADES: return None
 
-    # Max trades limit
-    if len(state["open_trades"]) >= MAX_OPEN_TRADES:
-        return None
-
-    # FIX 3: 24h re-entry prevention
-    recent = state.get("recent_symbols", {})
+    recent      = state.get("recent_symbols", {})
     last_closed = recent.get(symbol, 0)
     hours_since = (time.time() * 1000 - last_closed) / 3600000
-    if last_closed > 0 and hours_since < REENTRY_HOURS:
-        return None
+    if last_closed > 0 and hours_since < REENTRY_HOURS: return None
 
-    # Calculate invest amount
     portfolio_val = _portfolio_value(state)
     invest = round(min(float(state["balance"]), portfolio_val * MAX_PER_TRADE), 2)
-    if invest < 100:
-        return None
+    if invest < 100: return None
 
     price        = float(signal["price"])
     target_price = round(price * (1 + TAKE_PROFIT_PCT), 8)
     stop_price   = round(price * (1 - STOP_LOSS_PCT), 8)
     qty          = round(invest / price, 8)
-    max_hold_ms  = int(time.time() * 1000) + (MAX_HOLD_DAYS * 24 * 3600 * 1000)
+    max_hold_ms  = int(time.time() * 1000) + int(MAX_HOLD_DAYS * 24 * 3600 * 1000)
 
-    signals_list = signal.get("signals", [])
+    signals_list = signal.get("signals", []) or []
     signal_type  = signals_list[0].get("type", "") if signals_list else ""
 
     trade = {
@@ -164,8 +188,10 @@ def auto_buy(signal: dict) -> Optional[dict]:
         "name":          str(signal.get("name", symbol.replace("USDT",""))),
         "entry_price":   price,
         "current_price": price,
+        "peak_price":    price,       # NEW: track highest price seen
         "target_price":  target_price,
         "stop_price":    stop_price,
+        "initial_stop":  stop_price,  # original stop for reference
         "qty":           qty,
         "invested":      invest,
         "current_value": invest,
@@ -179,6 +205,7 @@ def auto_buy(signal: dict) -> Optional[dict]:
         "max_hold_until":max_hold_ms,
         "closed_at":     None,
         "close_reason":  None,
+        "trailing":      True,        # trailing stop enabled
     }
 
     state["balance"] = round(float(state["balance"]) - invest, 2)
@@ -188,14 +215,12 @@ def auto_buy(signal: dict) -> Optional[dict]:
 
 
 def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict]:
-    """Close a paper trade at current price."""
     state = _load()
     trade = next((t for t in state["open_trades"] if t["id"] == trade_id), None)
-    if not trade:
-        return None
+    if not trade: return None
 
     current_price = float(current_price)
-    sell_value    = round(trade["qty"] * current_price, 2)
+    sell_value    = round(float(trade["qty"]) * current_price, 2)
     pnl           = round(sell_value - float(trade["invested"]), 2)
     pnl_pct       = round(pnl / float(trade["invested"]) * 100, 2)
 
@@ -209,12 +234,11 @@ def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict
         "close_reason":  reason,
     })
 
-    state["open_trades"]   = [t for t in state["open_trades"] if t["id"] != trade_id]
+    state["open_trades"]  = [t for t in state["open_trades"] if t["id"] != trade_id]
     state["closed_trades"].insert(0, trade)
-    state["balance"]       = round(float(state["balance"]) + sell_value, 2)
-    state["total_profit"]  = round(float(state["total_profit"]) + pnl, 2)
+    state["balance"]      = round(float(state["balance"]) + sell_value, 2)
+    state["total_profit"] = round(float(state["total_profit"]) + pnl, 2)
 
-    # FIX 3: Record when this coin was last closed
     if "recent_symbols" not in state:
         state["recent_symbols"] = {}
     state["recent_symbols"][trade["symbol"]] = int(time.time() * 1000)
@@ -226,16 +250,14 @@ def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict
 async def monitor_loop():
     """
     Background loop — runs every 60s.
-    Checks live prices for all open paper trades.
-    Auto-sells on target, stop loss, or time limit.
-    FIX 2: Pauses buying when BTC drops 5%+
+    Trailing stop follows price up.
+    Profit locks protect gains.
     """
     while True:
         try:
             state = _load()
 
             if state["open_trades"]:
-                # FIX 2: Check BTC market condition
                 btc_change = await get_btc_change()
                 market_bad = btc_change < -5.0
 
@@ -244,39 +266,45 @@ async def monitor_loop():
                     if not price:
                         continue
 
-                    price = float(price)
+                    price    = float(price)
                     invested = float(trade["invested"])
-                    qty = float(trade["qty"])
+                    qty      = float(trade["qty"])
 
-                    # Update current value
+                    # Calculate trailing stop + profit locks
+                    new_stop, new_peak = _calc_trailing_stop(trade, price)
+
+                    # Update trade values
                     trade["current_price"] = price
                     trade["current_value"] = round(qty * price, 2)
                     trade["pnl"]           = round(trade["current_value"] - invested, 2)
                     trade["pnl_pct"]       = round(trade["pnl"] / invested * 100, 2)
+                    trade["peak_price"]    = new_peak
+                    trade["stop_price"]    = new_stop  # trailing stop updates here
 
                     close_reason = None
 
-                    # FIX 1: Time limit — sell after MAX_HOLD_DAYS
+                    # Time limit
                     max_hold = trade.get("max_hold_until", 0)
                     if max_hold and int(time.time() * 1000) > max_hold:
                         close_reason = "TIME_LIMIT"
 
-                    # Target hit
-                    elif price >= float(trade["target_price"]):
-                        close_reason = "TARGET_HIT"
+                    # Trailing stop hit
+                    elif price <= new_stop:
+                        # Only sell if we've moved up at least 1% first
+                        # (avoids selling on initial dip)
+                        peak = float(trade.get("peak_price", price))
+                        if peak > float(trade["entry_price"]) * 1.01:
+                            close_reason = "TRAILING_STOP"
+                        elif price <= float(trade["initial_stop"]):
+                            close_reason = "STOP_LOSS"
 
-                    # Stop loss hit
-                    elif price <= float(trade["stop_price"]):
-                        close_reason = "STOP_LOSS"
-
-                    # FIX 2: BTC crashing — close all positions
+                    # BTC crash
                     elif market_bad:
                         close_reason = "MARKET_CRASH"
 
                     if close_reason:
                         auto_sell(trade["id"], price, close_reason)
                     else:
-                        # Just save updated prices
                         _save(state)
 
                     await asyncio.sleep(0.5)
@@ -288,20 +316,19 @@ async def monitor_loop():
 
 
 def get_stats() -> dict:
-    state   = _load()
-    closed  = state["closed_trades"]
-    wins    = [t for t in closed if t["status"] == "WIN"]
-    losses  = [t for t in closed if t["status"] == "LOSS"]
-    open_t  = state["open_trades"]
+    state  = _load()
+    closed = state["closed_trades"]
+    wins   = [t for t in closed if t["status"] == "WIN"]
+    losses = [t for t in closed if t["status"] == "LOSS"]
+    open_t = state["open_trades"]
 
-    win_rate  = round(len(wins) / len(closed) * 100, 1) if closed else 0.0
-    avg_win   = round(sum(float(t["pnl_pct"]) for t in wins) / len(wins), 2) if wins else 0.0
-    avg_loss  = round(sum(float(t["pnl_pct"]) for t in losses) / len(losses), 2) if losses else 0.0
+    win_rate  = round(len(wins)/len(closed)*100, 1) if closed else 0.0
+    avg_win   = round(sum(float(t["pnl_pct"]) for t in wins)/len(wins), 2) if wins else 0.0
+    avg_loss  = round(sum(float(t["pnl_pct"]) for t in losses)/len(losses), 2) if losses else 0.0
     portfolio = _portfolio_value(state)
     total_ret = _total_return_pct(state)
     total_pnl = sum(float(t["pnl"]) for t in closed)
 
-    # Add days remaining to open trades
     open_display = []
     for t in open_t:
         td = dict(t)
@@ -309,6 +336,11 @@ def get_stats() -> dict:
         if max_hold:
             ms_left = max_hold - int(time.time() * 1000)
             td["days_remaining"] = round(max(0, ms_left / 86400000), 1)
+        # Show how much profit is locked
+        entry = float(t.get("entry_price", 0))
+        stop  = float(t.get("stop_price", 0))
+        if entry > 0:
+            td["locked_profit_pct"] = round((stop - entry) / entry * 100, 2)
         open_display.append(td)
 
     return {
