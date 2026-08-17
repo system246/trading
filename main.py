@@ -1,5 +1,5 @@
 """
-MarketPulse Python Backend — Final Version
+MarketPulse Python Backend — Final Version v4
 """
 
 import asyncio
@@ -28,17 +28,16 @@ scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting MarketPulse backend — Final Version")
+    log.info("Starting MarketPulse backend v4")
     asyncio.create_task(refresh_cache())
     asyncio.create_task(pt.monitor_loop())
     scheduler.add_job(refresh_cache, "interval", minutes=5, id="auto_scan")
     scheduler.start()
     yield
     scheduler.shutdown()
-    log.info("Backend stopped.")
 
 
-app = FastAPI(title="MarketPulse API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="MarketPulse API", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,17 +58,15 @@ async def refresh_cache():
             except:
                 r["ml_score"] = {"probability": 50, "grade": "C", "note": ""}
 
-            # Auto paper trade
-            if r.get("verdict") == "STRONG_BUY" and float(r.get("confidence", 0)) >= 80:
+            if r.get("verdict") == "STRONG_BUY" and float(r.get("confidence", 0)) >= 88:
                 try:
-                    # FIX 2: Check BTC before buying
                     btc_change = await pt.get_btc_change()
                     if btc_change > -5.0:
-                        trade = pt.auto_buy(r)
+                        trade = await pt.auto_buy(r)
                         if trade:
                             log.info(f"Paper trade opened: {r['name']} @ {r['price']}")
                     else:
-                        log.info(f"Skipping auto-buy {r['name']} — BTC down {btc_change:.1f}%")
+                        log.info(f"Skipping {r['name']} — BTC down {btc_change:.1f}%")
                 except Exception as e:
                     log.error(f"Auto-buy error: {e}")
 
@@ -82,7 +79,7 @@ async def refresh_cache():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "3.0.0", "signals": len(cached_results)}
+    return {"status": "ok", "version": "4.0.0", "signals": len(cached_results)}
 
 
 @app.get("/health")
@@ -154,7 +151,7 @@ async def btc_status():
     return await get_btc_health()
 
 
-# ── PAPER TRADING ENDPOINTS ───────────────────────────────────
+# ── PAPER TRADING ─────────────────────────────────────────────
 
 @app.get("/paper/stats")
 def paper_stats():
