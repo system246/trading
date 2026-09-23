@@ -1,8 +1,7 @@
 """
-scanner.py v3 — Maximum improvements
-NEW: Volatility filter, signal age decay, volume confirmation,
-     breakeven speed, risk scoring, whale detection,
-     momentum quality, dynamic targets, all filters combined
+scanner.py v2 — Enhanced signal detection
+NEW: Multi-timeframe, ADX trend strength, volume profile,
+     EMA pullback entry, coin quality filter
 """
 
 import asyncio
@@ -66,178 +65,10 @@ def klines_to_df(klines):
     return df
 
 
-# ── NEW: VOLATILITY FILTER ────────────────────────────────────
-def calc_volatility_score(df) -> dict:
-    """
-    Score 0-100. Higher = more stable = better for trading.
-    Volatile coins get stopped out more often.
-    """
-    try:
-        c = df["close"].values
-        returns = np.diff(c) / c[:-1]
-        daily_vol = float(np.std(returns) * 100)
-        max_dd = 0.0
-        peak = c[0]
-        for price in c:
-            if price > peak: peak = price
-            dd = (peak - price) / peak * 100
-            if dd > max_dd: max_dd = dd
-
-        # Score: low volatility = high score
-        vol_score = max(0, 100 - daily_vol * 5)
-        dd_score  = max(0, 100 - max_dd)
-        score     = round((vol_score + dd_score) / 2, 1)
-
-        return {
-            "score":     score,
-            "daily_vol": round(daily_vol, 2),
-            "max_dd":    round(max_dd, 1),
-            "tradeable": bool(daily_vol < 8 and max_dd < 40),
-        }
-    except:
-        return {"score": 50, "daily_vol": 0, "max_dd": 0, "tradeable": True}
-
-
-# ── NEW: BREAKEVEN SPEED ──────────────────────────────────────
-def calc_breakeven_speed(df) -> dict:
-    """
-    How fast does this coin move after a signal?
-    Fast movers = better for short-term trading.
-    """
-    try:
-        c = df["close"].values
-        speeds = []
-        for i in range(len(c) - 5):
-            move = abs(c[i+5] - c[i]) / c[i] * 100
-            speeds.append(move)
-        avg_5d_move = float(np.mean(speeds)) if speeds else 0
-        fast = bool(avg_5d_move > 5)
-        return {
-            "avg_5d_move": round(avg_5d_move, 2),
-            "fast_mover":  fast,
-        }
-    except:
-        return {"avg_5d_move": 0, "fast_mover": False}
-
-
-# ── NEW: WHALE DETECTION ──────────────────────────────────────
-def calc_whale_signal(df_h) -> dict:
-    """
-    Detect large volume candles = whale accumulation.
-    Big money moves in quietly before price moves.
-    """
-    try:
-        v = df_h["volume"]
-        c = df_h["close"]
-        vol_mean = float(v.mean())
-        vol_std  = float(v.std())
-
-        # Find candles with volume > 2 std above mean
-        whale_candles = v[v > vol_mean + 2 * vol_std]
-        whale_count   = len(whale_candles)
-
-        # Check if whale candles were buying (green) or selling (red)
-        if whale_count > 0:
-            whale_idx    = whale_candles.index
-            opens        = df_h.loc[whale_idx, "open"]
-            closes       = df_h.loc[whale_idx, "close"]
-            buying_whales= int((closes > opens).sum())
-            selling_whales= whale_count - buying_whales
-        else:
-            buying_whales  = 0
-            selling_whales = 0
-
-        whale_buying = bool(buying_whales > selling_whales and whale_count >= 2)
-        return {
-            "whale_count":    whale_count,
-            "buying_whales":  buying_whales,
-            "selling_whales": selling_whales,
-            "whale_buying":   whale_buying,
-        }
-    except:
-        return {"whale_count": 0, "buying_whales": 0, "selling_whales": 0, "whale_buying": False}
-
-
-# ── NEW: RISK SCORE ───────────────────────────────────────────
-def calc_risk_score(vol_data: dict, confidence: float, btc_rsi: float = 50, quality: dict = None) -> dict:
-    """
-    Overall risk score for a trade.
-    LOW / MEDIUM / HIGH based on multiple factors.
-    """
-    risk_points = 0
-
-    # Volatility risk
-    if vol_data.get("daily_vol", 0) > 6:  risk_points += 2
-    elif vol_data.get("daily_vol", 0) > 3: risk_points += 1
-
-    # Confidence risk
-    if confidence < 88:   risk_points += 2
-    elif confidence < 92: risk_points += 1
-
-    # Market risk (BTC)
-    if btc_rsi > 70:   risk_points += 2  # overbought market
-    elif btc_rsi > 60: risk_points += 1
-
-    # Coin quality risk
-    if quality:
-        if quality.get("pump_risk"):                    risk_points += 3
-        if float(quality.get("volatility", 0)) > 15:   risk_points += 1
-
-    if risk_points <= 1:   level = "LOW"
-    elif risk_points <= 3: level = "MEDIUM"
-    else:                  level = "HIGH"
-
-    return {"points": risk_points, "level": level}
-
-
-# ── NEW: DYNAMIC TARGETS ──────────────────────────────────────
-def calc_dynamic_targets(price: float, ind_h: dict, ind_d: dict, speed: dict, confidence: float) -> dict:
-    """
-    Targets adjust based on momentum strength and coin speed.
-    Strong momentum + fast mover = higher target.
-    """
-    atr      = float(ind_h.get("atr") or ind_d.get("atr") or price * 0.03)
-    bb_upper = float(ind_d.get("bb_upper") or price * 1.10)
-    bb_lower = float(ind_d.get("bb_lower") or price * 0.93)
-
-    # Base multipliers
-    t1_mult = 2.0
-    t2_mult = 3.0
-    sl_mult = 1.5
-
-    # Adjust for confidence
-    if confidence >= 95:
-        t1_mult = 2.5; t2_mult = 4.0
-    elif confidence >= 90:
-        t1_mult = 2.2; t2_mult = 3.5
-
-    # Adjust for fast movers
-    if speed.get("fast_mover"):
-        t1_mult *= 1.2; t2_mult *= 1.2
-
-    # Adjust for strong momentum
-    if ind_h.get("supertrend_bull") and ind_d.get("supertrend_bull"):
-        t2_mult *= 1.3
-
-    target1 = round(price + t1_mult * atr, 8)
-    target2 = round(max(bb_upper, price + t2_mult * atr), 8)
-    stop    = round(max(price - sl_mult * atr, bb_lower), 8)
-
-    up1  = round((target1 - price) / price * 100, 1)
-    up2  = round((target2 - price) / price * 100, 1)
-    down = round((price - stop) / price * 100, 1)
-    rr   = round(up1 / down, 1) if down > 0 else 0
-
-    return {
-        "target1":  target1, "target2": target2, "stop": stop,
-        "upside1":  f"+{up1}%", "upside2": f"+{up2}%",
-        "downside": f"-{down}%", "risk_reward": rr,
-    }
-
-
 def calc_adx(high, low, close, window=14):
     try:
-        return round(float(ta.trend.ADXIndicator(high, low, close, window=window).adx().iloc[-1]), 1)
+        adx = ta.trend.ADXIndicator(high, low, close, window=window)
+        return round(float(adx.adx().iloc[-1]), 1)
     except:
         return None
 
@@ -250,8 +81,8 @@ def calc_volume_profile(df, bins=10):
         df2["bin"] = pd.cut(df2["close"], bins=bins, labels=False)
         profile = df2.groupby("bin")["volume"].sum()
         current_price = df["close"].iloc[-1]
-        current_bin = int((current_price - df["close"].min()) / price_range * (bins-1))
-        current_bin = max(0, min(bins-1, current_bin))
+        current_bin = int((current_price - df["close"].min()) / price_range * (bins - 1))
+        current_bin = max(0, min(bins - 1, current_bin))
         vol_at_price = float(profile.get(current_bin, 0))
         max_vol = float(profile.max())
         return round(vol_at_price / max_vol, 2) if max_vol > 0 else 0
@@ -261,19 +92,19 @@ def calc_volume_profile(df, bins=10):
 
 def calc_coin_quality(df_d, vol_usd):
     try:
-        days_data  = len(df_d)
-        closes     = df_d["close"].values
-        volumes    = df_d["volume"].values
-        active_days= int(np.sum(volumes > 0))
-        consistency= active_days / days_data if days_data > 0 else 0
-        returns    = np.diff(closes) / closes[:-1]
+        days_data = len(df_d)
+        closes = df_d["close"].values
+        volumes = df_d["volume"].values
+        active_days = int(np.sum(volumes > 0))
+        consistency = active_days / days_data if days_data > 0 else 0
+        returns = np.diff(closes) / closes[:-1]
         volatility = float(np.std(returns) * 100)
         daily_changes = np.abs(returns * 100)
-        max_single_day= float(np.max(daily_changes)) if len(daily_changes) > 0 else 0
-        pump_risk  = bool(max_single_day > 50)
+        max_single_day = float(np.max(daily_changes)) if len(daily_changes) > 0 else 0
+        pump_risk = bool(max_single_day > 50)
         quality_score = consistency * 100
         if volatility > 20: quality_score -= 20
-        if pump_risk:       quality_score -= 30
+        if pump_risk: quality_score -= 30
         if vol_usd > 1_000_000: quality_score += 10
         return {
             "score":       round(max(0.0, min(100.0, quality_score)), 1),
@@ -315,11 +146,11 @@ def calc_indicators(df):
         out["bb_lower"]   = round(lower, 8)
         out["bb_width"]   = round(bw, 4)
         out["bb_squeeze"] = bool(bw < 0.05)
-        out["bb_pct"]     = round((price-lower)/(upper-lower), 3) if upper != lower else 0.5
+        out["bb_pct"]     = round((price - lower) / (upper - lower), 3) if upper != lower else 0.5
     except: pass
 
     try:
-        out["atr"] = round(float(ta.volatility.AverageTrueRange(h,l,c,window=14).average_true_range().iloc[-1]), 8)
+        out["atr"] = round(float(ta.volatility.AverageTrueRange(h, l, c, window=14).average_true_range().iloc[-1]), 8)
     except: pass
 
     try:
@@ -330,8 +161,8 @@ def calc_indicators(df):
         out["ema21"]       = round(float(ema21.iloc[-1]), 8)
         out["ema50"]       = round(float(ema50.iloc[-1]), 8)
         out["ema_bullish"] = bool(float(ema9.iloc[-1]) > float(ema21.iloc[-1]))
-        price      = float(c.iloc[-1])
-        ema21_val  = float(ema21.iloc[-1])
+        price = float(c.iloc[-1])
+        ema21_val = float(ema21.iloc[-1])
         prev_price = float(c.iloc[-2]) if len(c) > 1 else price
         out["ema_pullback"] = bool(
             out["ema_bullish"] and
@@ -350,26 +181,26 @@ def calc_indicators(df):
         obv_s = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume()
         if len(obv_s) >= 14:
             now = float(obv_s.iloc[-1]); ago = float(obv_s.iloc[-7])
-            out["obv_trend"] = round((now/ago-1)*100, 1) if ago != 0 else 0.0
+            out["obv_trend"] = round((now / ago - 1) * 100, 1) if ago != 0 else 0.0
     except: pass
 
     try:
         if len(v) >= 30:
             recent = float(v.iloc[-6:].mean())
             base   = float(v.iloc[-30:-6].mean())
-            ratio  = round(recent/base, 2) if base > 0 else 1.0
+            ratio  = round(recent / base, 2) if base > 0 else 1.0
             out["vol_ratio_6h"] = ratio
             out["vol_spike"]    = bool(ratio > 1.8)
     except: pass
 
     closes = c.values
     def pct(n):
-        return round(float((closes[-1]/closes[-1-n]-1)*100), 2) if len(closes) > n else 0.0
+        return round(float((closes[-1] / closes[-1-n] - 1) * 100), 2) if len(closes) > n else 0.0
 
     out["ch3h"]  = pct(3)
     out["ch6h"]  = pct(6)
     out["ch24h"] = pct(24)
-    out["ch7d"]  = pct(min(168, len(closes)-1))
+    out["ch7d"]  = pct(min(168, len(closes) - 1))
     out["adx"]   = calc_adx(h, l, c)
 
     try:
@@ -403,7 +234,7 @@ def calc_mtf_score(ind_15m, ind_1h, ind_4h, ind_1d):
     return score
 
 
-def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality, vol_data, whale, speed):
+def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality):
     signals = []
     rsi_h = ind_h.get("rsi")
     rsi_d = ind_d.get("rsi")
@@ -412,31 +243,17 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality,
     ch7d  = float(ind_d.get("ch7d") or 0)
     adx   = ind_h.get("adx")
 
-    # ── HARD FILTERS ─────────────────────────────────────────
     if abs(ch24h) > 40 or abs(ch3h) > 15: return []
     if quality and quality.get("pump_risk"): return []
     if quality and float(quality.get("score") or 100) < 30: return []
 
-    # NEW: Volatility filter — skip too volatile coins
-    if vol_data and not vol_data.get("tradeable", True): return []
-
-    # NEW: Speed filter — skip slow movers for short-term
-    # (only apply if we have data)
-    is_fast = speed.get("fast_mover", True) if speed else True
-
     mtf = calc_mtf_score(ind_15m, ind_h, ind_4h, ind_d)
-    mtf_bonus      = mtf * 8
-    adx_ok         = adx is not None and float(adx) > 20
-    adx_bonus      = 15 if adx_ok else 0
+    mtf_bonus = mtf * 8
+    adx_ok    = adx is not None and float(adx) > 20
+    adx_bonus = 15 if adx_ok else 0
     pullback_bonus = 12 if ind_h.get("ema_pullback") else 0
-    vol_support    = float(ind_h.get("vol_support") or 0)
-    vp_bonus       = 10 if vol_support > 0.6 else 5 if vol_support > 0.4 else 0
-
-    # NEW: Whale buying bonus
-    whale_bonus = 20 if whale and whale.get("whale_buying") else 0
-
-    # NEW: Fast mover bonus
-    speed_bonus = 10 if is_fast else 0
+    vol_support = float(ind_h.get("vol_support") or 0)
+    vp_bonus = 10 if vol_support > 0.6 else 5 if vol_support > 0.4 else 0
 
     # SIGNAL 1: EARLY VOLUME
     score, conf, reasons = 0, 0, []
@@ -457,9 +274,7 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality,
         score += 12; conf += 1; reasons.append("MACD just turned bullish")
     if mtf >= 3:
         score += mtf_bonus; conf += 1; reasons.append(f"MTF confirmed on {mtf}/4 timeframes")
-    if whale and whale.get("whale_buying"):
-        score += whale_bonus; conf += 1; reasons.append("Whale accumulation detected")
-    score += adx_bonus + pullback_bonus + vp_bonus + speed_bonus
+    score += adx_bonus + pullback_bonus + vp_bonus
     if conf >= 2 and score >= 55:
         signals.append({"type":"EARLY VOLUME","icon":"⚡","score":score,"conf":conf,
                         "reasons":reasons,"timeframe":"Hours to 1 day","early_score":min(96,80+score//5)})
@@ -482,8 +297,6 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality,
         score += 10; conf += 1; reasons.append(f"Stochastic oversold at {ind_h['stoch_k']:.0f}")
     if mtf >= 2:
         score += mtf_bonus; conf += 1; reasons.append(f"Reversal confirmed on {mtf} timeframes")
-    if whale and whale.get("whale_buying"):
-        score += whale_bonus; conf += 1; reasons.append("Whales buying the dip")
     score += adx_bonus + vp_bonus
     if conf >= 2 and score >= 52:
         signals.append({"type":"REVERSAL","icon":"📡","score":score,"conf":conf,
@@ -502,7 +315,7 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality,
         score += 10; reasons.append(f"RSI building momentum at {rsi_h}")
     if mtf >= 2:
         score += mtf_bonus; conf += 1; reasons.append(f"Squeeze confirmed on {mtf} timeframes")
-    score += adx_bonus + speed_bonus
+    score += adx_bonus
     if conf >= 2 and score >= 55:
         signals.append({"type":"SQUEEZE","icon":"🔒","score":score,"conf":conf,
                         "reasons":reasons,"timeframe":"1–4 days","early_score":min(96,74+score//5)})
@@ -521,8 +334,6 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality,
         score += 8; conf += 1; reasons.append("EMA9 above EMA21 — uptrend forming")
     if vol_support > 0.5:
         score += 15; conf += 1; reasons.append("High volume accumulated at current price")
-    if whale and whale.get("whale_buying"):
-        score += whale_bonus; conf += 1; reasons.append("Whale accumulation confirmed")
     score += mtf_bonus // 2
     if conf >= 2 and score >= 60:
         signals.append({"type":"ACCUMULATION","icon":"🐋","score":score,"conf":conf,
@@ -546,8 +357,6 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality,
         score += mtf_bonus; conf += 1; reasons.append(f"Trend confirmed on {mtf}/4 timeframes")
     if ind_h.get("ema_pullback"):
         score += pullback_bonus; reasons.append("Perfect pullback to EMA — ideal entry")
-    if is_fast:
-        score += speed_bonus; reasons.append("Fast mover — historically moves quickly")
     if conf >= 2 and score >= 58:
         signals.append({"type":"SUPERTREND","icon":"🚀","score":score,"conf":conf,
                         "reasons":reasons,"timeframe":"1–5 days","early_score":min(96,75+score//5)})
@@ -560,8 +369,6 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality,
             score += 22; conf += 1; reasons.append(f"RSI oversold at {rsi_h}")
         if float(ind_h.get("obv_trend") or 0) > 0:
             score += 18; conf += 1; reasons.append("Spot buyers absorbing")
-        if whale and whale.get("whale_buying"):
-            score += whale_bonus; conf += 1; reasons.append("Whales accumulating")
         if conf >= 1 and score >= 50:
             signals.append({"type":"FUNDING","icon":"💰","score":score,"conf":conf,
                             "reasons":reasons,"timeframe":"Hours to 1 day","early_score":min(96,72+score//5)})
@@ -570,36 +377,32 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality,
     return signals
 
 
-def calc_verdict(signals, ind_h, ind_d, ch24h, ch7d, risk_score=None):
+def calc_verdict(signals, ind_h, ind_d, ch24h, ch7d):
     ch24h = float(ch24h or 0)
     ch7d  = float(ch7d or 0)
     if ch24h > 20:
         return {"verdict":"DANGER","confidence":95,"reason":"Already pumped hard. Skip.","risk":"VERY_HIGH"}
     if ch7d > 40:
-        return {"verdict":"DANGER","confidence":90,"reason":"Up 40%+ this week.","risk":"VERY_HIGH"}
+        return {"verdict":"DANGER","confidence":90,"reason":"Up 40%+ this week. Easy money gone.","risk":"VERY_HIGH"}
     if not signals:
-        return {"verdict":"AVOID","confidence":20,"reason":"No clear signal.","risk":"HIGH"}
+        return {"verdict":"AVOID","confidence":20,"reason":"No clear signal right now.","risk":"HIGH"}
 
     best  = signals[0]
     score = float(best["early_score"])
     adx   = ind_h.get("adx")
-    rsi_d = ind_d.get("rsi")
 
     if ind_h.get("macd_crossed"):     score += 10
-    if rsi_d and float(rsi_d) < 30:  score += 12
-    if rsi_d and float(rsi_d) > 75:  score -= 15
-    if ind_h.get("supertrend_bull"):  score += 8
-    if ind_d.get("supertrend_bull"):  score += 5
-    if adx and float(adx) > 25:       score += 8
-    if ind_h.get("ema_pullback"):     score += 6
-
-    # Risk adjustment
-    if risk_score and risk_score.get("level") == "HIGH":   score -= 10
-    if risk_score and risk_score.get("level") == "LOW":    score += 5
-
+    rsi_d = ind_h.get("rsi")
+    rsi_d2 = ind_d.get("rsi")
+    if rsi_d2 and float(rsi_d2) < 30:  score += 12
+    if rsi_d2 and float(rsi_d2) > 75:  score -= 15
+    if ind_h.get("supertrend_bull"):   score += 8
+    if ind_d.get("supertrend_bull"):   score += 5
+    if adx and float(adx) > 25:        score += 8
+    if ind_h.get("ema_pullback"):      score += 6
     score = min(98.0, max(5.0, score))
-    n = len(signals)
 
+    n = len(signals)
     if score >= 82 and n >= 2:
         v, risk = "STRONG_BUY", "LOW"
         pts = []
@@ -619,6 +422,21 @@ def calc_verdict(signals, ind_h, ind_d, ch24h, ch7d, risk_score=None):
         reason = "No clear signal. Better opportunities will come."
 
     return {"verdict": v, "confidence": round(score), "reason": reason, "risk": risk}
+
+
+def calc_targets(price, ind_h, ind_d):
+    atr      = float(ind_h.get("atr") or ind_d.get("atr") or price * 0.03)
+    bb_upper = float(ind_d.get("bb_upper") or price * 1.10)
+    bb_lower = float(ind_d.get("bb_lower") or price * 0.93)
+    target1  = round(price + 2.0 * atr, 8)
+    target2  = round(max(bb_upper, price + 3.0 * atr), 8)
+    stop     = round(max(price - 1.5 * atr, bb_lower), 8)
+    up1  = round((target1 - price) / price * 100, 1)
+    up2  = round((target2 - price) / price * 100, 1)
+    down = round((price - stop) / price * 100, 1)
+    rr   = round(up1 / down, 1) if down > 0 else 0
+    return {"target1":target1,"target2":target2,"stop":stop,
+            "upside1":f"+{up1}%","upside2":f"+{up2}%","downside":f"-{down}%","risk_reward":rr}
 
 
 async def fetch_coin_data(client, symbol):
@@ -650,7 +468,7 @@ async def fetch_coin_data(client, symbol):
     if isinstance(b_raw, dict):
         bids = sum(float(x[1]) for x in b_raw.get("bids", []))
         asks = sum(float(x[1]) for x in b_raw.get("asks", []))
-        book = round(bids/asks, 2) if asks > 0 else None
+        book = round(bids / asks, 2) if asks > 0 else None
 
     return {"df_15m":df_15m,"df_1h":df_1h,"df_4h":df_4h,"df_1d":df_1d,"funding":funding,"book":book}
 
@@ -666,20 +484,14 @@ def _build_result(symbol, price, df_15m, df_1h, df_4h, df_1d, funding, book, ch2
     if vol_support is not None:
         ind_1h["vol_support"] = vol_support
 
-    quality   = calc_coin_quality(df_1d, vol_usd)
-    vol_data  = calc_volatility_score(df_1d)
-    whale     = calc_whale_signal(df_1h)
-    speed     = calc_breakeven_speed(df_1d)
+    quality = calc_coin_quality(df_1d, vol_usd)
 
-    signals = detect_signals(ind_1h, ind_1d, ind_4h, ind_15m, price, funding, book, quality, vol_data, whale, speed)
-    if not signals: return None
+    signals = detect_signals(ind_1h, ind_1d, ind_4h, ind_15m, price, funding, book, quality)
+    if not signals:
+        return None
 
-    confidence = 0.0
-    risk_score = calc_risk_score(vol_data, confidence, quality=quality)
-    verdict    = calc_verdict(signals, ind_1h, ind_1d, ch24h, ind_1d.get("ch7d", 0), risk_score)
-    confidence = float(verdict["confidence"])
-    risk_score = calc_risk_score(vol_data, confidence, quality=quality)
-    targets    = calc_dynamic_targets(price, ind_1h, ind_1d, speed, confidence)
+    verdict = calc_verdict(signals, ind_1h, ind_1d, ch24h, ind_1d.get("ch7d", 0))
+    targets = calc_targets(price, ind_1h, ind_1d)
 
     result = {
         "symbol":          symbol,
@@ -708,10 +520,6 @@ def _build_result(symbol, price, df_15m, df_1h, df_4h, df_1d, funding, book, ch2
         "ema_pullback":    bool(ind_1h.get("ema_pullback", False)),
         "mtf_score":       calc_mtf_score(ind_15m, ind_1h, ind_4h, ind_1d),
         "quality":         quality,
-        "volatility":      vol_data,
-        "whale":           whale,
-        "speed":           speed,
-        "risk_score":      risk_score,
         "funding":         funding,
         "book":            book,
         "signals":         signals,
@@ -749,8 +557,8 @@ async def get_all_pairs(client):
         if vol < MIN_VOL or vol > MAX_VOL: continue
         if price < 0.000001: continue
         pairs.append({"symbol":sym,"price":price,
-                      "ch24h":float(t.get("priceChangePercent",0)),
-                      "vol":vol,"count":int(t.get("count",0))})
+                      "ch24h":float(t.get("priceChangePercent", 0)),
+                      "vol":vol,"count":int(t.get("count", 0))})
     pairs.sort(key=lambda x: -x["count"])
     return pairs[:MAX_COINS]
 
@@ -776,7 +584,7 @@ async def full_scan():
         await asyncio.gather(*[scan_one(t) for t in pairs])
 
     order = {"STRONG_BUY":0,"BUY":1,"WATCH":2,"AVOID":3,"DANGER":4,"STALE":5}
-    results.sort(key=lambda r: (order.get(r.get("verdict","AVOID"),6), -r.get("confidence",0)))
+    results.sort(key=lambda r: (order.get(r.get("verdict","AVOID"), 6), -r.get("confidence", 0)))
     return results
 
 
@@ -793,11 +601,10 @@ async def get_btc_health():
     losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
     ag = float(np.mean(gains[-14:]))
     al = float(np.mean(losses[-14:]))
-    rsi_v = round(100 - 100/(1+ag/al), 1) if al > 0 else 100.0
-    if ch24h < -5 or rsi_v < 30:   mood,label,color = "BAD",     "Bad — Stay Careful",  "red"
-    elif ch24h < -2:                mood,label,color = "WEAK",    "Weak Market",          "orange"
-    elif rsi_v > 75:                mood,label,color = "HOT",     "Market Overheated",    "yellow"
-    elif ch24h > 3 and rsi_v < 68: mood,label,color = "GOOD",    "Good Day for Crypto",  "green"
-    else:                           mood,label,color = "NEUTRAL", "Market is Calm",       "gray"
-    return {"mood":mood,"label":label,"color":color,
-            "btc_price":price,"ch24h":ch24h,"rsi":rsi_v}
+    rsi_v = round(100 - 100 / (1 + ag/al), 1) if al > 0 else 100.0
+    if ch24h < -5 or rsi_v < 30:   mood, label, color = "BAD",     "Bad — Stay Careful",  "red"
+    elif ch24h < -2:                mood, label, color = "WEAK",    "Weak Market",          "orange"
+    elif rsi_v > 75:                mood, label, color = "HOT",     "Market Overheated",    "yellow"
+    elif ch24h > 3 and rsi_v < 68: mood, label, color = "GOOD",    "Good Day for Crypto",  "green"
+    else:                           mood, label, color = "NEUTRAL", "Market is Calm",       "gray"
+    return {"mood":mood,"label":label,"color":color,"btc_price":price,"ch24h":ch24h,"rsi":rsi_v}
