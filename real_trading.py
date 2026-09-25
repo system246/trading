@@ -19,7 +19,9 @@ from typing import Optional
 
 REAL_FILE        = "real_trades.json"
 BINANCE_REST     = "https://api.binance.com"
-FEE_PCT          = 0.00075   # 0.075% with BNB discount
+FEE_PCT          = 0.00075
+TDS_PCT          = 0.01     # 1% TDS on sell (Indian law)
+INCOME_TAX_PCT   = 0.30     # 30% flat tax on crypto profit   # 0.075% with BNB discount
 MIN_CONFIDENCE   = 92
 MAX_PER_TRADE    = 0.10      # 10% per trade
 MAX_OPEN_TRADES  = 3
@@ -346,15 +348,24 @@ async def close_real_trade(trade_id: str, reason: str) -> dict:
     else:
         sell_price = order.get("price") or float(trade["current_price"])
 
-    sell_fee   = round(qty * sell_price * FEE_PCT, 4)
-    sell_value = round(qty * sell_price - sell_fee, 2)
-    pnl        = round(sell_value - float(trade["invested"]), 2)
-    pnl_pct    = round(pnl / float(trade["invested"]) * 100, 2)
+    sell_gross   = round(qty * sell_price, 2)
+    sell_fee     = round(sell_gross * FEE_PCT, 4)
+    tds          = round(sell_gross * TDS_PCT, 2)
+    sell_value   = round(sell_gross - sell_fee - tds, 2)
+    pnl          = round(sell_value - float(trade["invested"]), 2)
+    pnl_pct      = round(pnl / float(trade["invested"]) * 100, 2)
+    tax_estimate = round(max(0, pnl * INCOME_TAX_PCT), 2)
+    net_profit   = round(pnl - tax_estimate, 2)
+    net_pct      = round(net_profit / float(trade["invested"]) * 100, 2)
 
     trade.update({
         "current_price": sell_price,
         "current_value": sell_value,
         "sell_fee":      sell_fee,
+        "tds":           tds,
+        "tax_estimate":  tax_estimate,
+        "net_profit":    net_profit,
+        "net_pct":       net_pct,
         "total_fees":    round(float(trade.get("buy_fee",0)) + sell_fee, 4),
         "pnl":           pnl,
         "pnl_pct":       pnl_pct,
@@ -459,6 +470,9 @@ def get_real_stats() -> dict:
         "total_fees":     round(float(state.get("total_fees",0)), 4),
         "avg_win":        round(sum(float(t.get("pnl_pct",0)) for t in wins)/len(wins), 2) if wins else 0,
         "avg_loss":       round(sum(float(t.get("pnl_pct",0)) for t in losses)/len(losses), 2) if losses else 0,
+        "total_tds":      round(sum(float(t.get("tds",0)) for t in closed), 2),
+        "total_tax_est":  round(sum(float(t.get("tax_estimate",0)) for t in closed), 2),
+        "total_net":      round(sum(float(t.get("net_profit",0)) for t in closed), 2),
         "pending_signals":state.get("pending_signals", []),
         "open_trades":    open_t,
         "closed_trades":  closed[:20],

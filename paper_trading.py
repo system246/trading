@@ -26,7 +26,9 @@ CHECK_INTERVAL   = 60
 TRAILING_PCT     = 0.05
 TAKE_PROFIT_PCT  = 0.06
 STOP_LOSS_PCT    = 0.03
-FEE_PCT          = 0.001       # 0.1% per side (Binance fee)
+FEE_PCT          = 0.001
+TDS_PCT          = 0.01     # 1% TDS on sell (Indian law)
+INCOME_TAX_PCT   = 0.30     # 30% flat tax on crypto profit (Indian law)       # 0.1% per side (Binance fee)
 
 # Smart position sizing by confidence
 # confidence >= X → invest Y% of portfolio
@@ -440,6 +442,9 @@ def get_stats() -> dict:
         "win_rate":         win_rate,
         "avg_win_pct":      avg_win,
         "avg_loss_pct":     avg_loss,
+        "total_tds_paid":   round(total_tds, 2),
+        "total_tax_est":    round(total_tax, 2),
+        "total_net_profit": round(total_net, 2),
         "auto_enabled":     bool(state.get("auto_enabled", True)),
         "signal_stats":     state.get("signal_stats", {}),
         "open_trades":      open_display,
