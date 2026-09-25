@@ -18,8 +18,8 @@ from typing import Optional
 
 PAPER_FILE       = "paper_trades.json"
 STARTING_BALANCE = 20000.0
-MAX_OPEN_TRADES  = 5
-MIN_CONFIDENCE   = 88          # raised from 85
+MAX_OPEN_TRADES  = 3
+MIN_CONFIDENCE   = 92          # raised from 85
 MAX_HOLD_DAYS    = 1.5         # reduced from 2.5
 REENTRY_HOURS    = 24
 CHECK_INTERVAL   = 60

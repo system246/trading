@@ -20,9 +20,9 @@ from typing import Optional
 REAL_FILE        = "real_trades.json"
 BINANCE_REST     = "https://api.binance.com"
 FEE_PCT          = 0.00075   # 0.075% with BNB discount
-MIN_CONFIDENCE   = 88
+MIN_CONFIDENCE   = 92
 MAX_PER_TRADE    = 0.10      # 10% per trade
-MAX_OPEN_TRADES  = 5
+MAX_OPEN_TRADES  = 3
 STOP_LOSS_PCT    = 0.03
 TAKE_PROFIT_PCT  = 0.06
 TRAILING_PCT     = 0.05
