@@ -413,7 +413,11 @@ def get_stats() -> dict:
     portfolio = _portfolio_value(state)
     total_ret = _total_return_pct(state)
     total_pnl = sum(float(t["pnl"]) for t in closed)
-    total_fees= sum(float(t.get("total_fees", 0)) for t in closed)
+    # total_fees= sum(float(t.get("total_fees", 0)) for t in closed)
+    total_fees = sum(float(t.get("total_fees",0)) for t in closed)
+    total_tds  = sum(float(t.get("tds",0)) for t in closed)
+    total_tax  = sum(float(t.get("tax_estimate",0)) for t in closed)
+    total_net  = sum(float(t.get("net_profit",0)) for t in closed)
 
     open_display = []
     for t in open_t:
@@ -435,6 +439,9 @@ def get_stats() -> dict:
         "total_return_pct": total_ret,
         "total_profit":     round(total_pnl, 2),
         "total_fees_paid":  round(total_fees, 2),
+        "total_tds_paid":   round(total_tds, 2),
+        "total_tax_est":    round(total_tax, 2),
+        "total_net_profit": round(total_net, 2),
         "open_count":       len(open_t),
         "closed_count":     len(closed),
         "win_count":        len(wins),
@@ -442,9 +449,6 @@ def get_stats() -> dict:
         "win_rate":         win_rate,
         "avg_win_pct":      avg_win,
         "avg_loss_pct":     avg_loss,
-        "total_tds_paid":   round(total_tds, 2),
-        "total_tax_est":    round(total_tax, 2),
-        "total_net_profit": round(total_net, 2),
         "auto_enabled":     bool(state.get("auto_enabled", True)),
         "signal_stats":     state.get("signal_stats", {}),
         "open_trades":      open_display,
