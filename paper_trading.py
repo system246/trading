@@ -160,7 +160,7 @@ async def get_live_price(symbol: str) -> Optional[float]:
 
 async def check_momentum(symbol: str) -> bool:
     """
-    Momentum check — coin must already be moving up.
+    Momntum check — coin must already be moving up.
     Checks last 3 hourly candles.
     Returns True if upward momentum confirmed.
     """
