@@ -380,7 +380,7 @@ async def monitor_loop():
                         close_reason = "TIME_LIMIT"
                     elif price <= new_stop:
                         peak = float(trade.get("peak_price", price))
-                        if peak > float(trade["entry_price"]) * 1.01:
+                        if peak > float(trade["entry_price"]) * 1.02:
                             close_reason = "TRAILING_STOP"
                         elif price <= float(trade["initial_stop"]):
                             close_reason = "STOP_LOSS"
