@@ -256,28 +256,28 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality)
     vp_bonus = 10 if vol_support > 0.6 else 5 if vol_support > 0.4 else 0
 
     # SIGNAL 1: EARLY VOLUME
-    score, conf, reasons = 0, 0, []
-    if ind_h.get("vol_spike"):
-        score += 35; conf += 1
-        reasons.append(f"Volume {ind_h['vol_ratio_6h']}x normal in last 6h")
-    if abs(ch24h) < 8 and abs(ch3h) < 4:
-        score += 20; conf += 1
-        reasons.append("Price quiet — volume moved first (early signal)")
-    if float(ind_h.get("obv_trend") or 0) > 10:
-        score += 15; conf += 1
-        reasons.append(f"OBV rising {ind_h['obv_trend']:.1f}% — real buyers")
-    if rsi_h and float(rsi_h) < 60:
-        score += 8; reasons.append(f"RSI {rsi_h} — room to move up")
-    if book and float(book) > 1.3:
-        score += 10; conf += 1; reasons.append(f"Buy orders stacking ({book}x)")
-    if ind_h.get("macd_crossed"):
-        score += 12; conf += 1; reasons.append("MACD just turned bullish")
-    if mtf >= 3:
-        score += mtf_bonus; conf += 1; reasons.append(f"MTF confirmed on {mtf}/4 timeframes")
-    score += adx_bonus + pullback_bonus + vp_bonus
-    if conf >= 2 and score >= 55:
-        signals.append({"type":"EARLY VOLUME","icon":"⚡","score":score,"conf":conf,
-                        "reasons":reasons,"timeframe":"Hours to 1 day","early_score":min(96,80+score//5)})
+    # score, conf, reasons = 0, 0, []
+    # if ind_h.get("vol_spike"):
+    #     score += 35; conf += 1
+    #     reasons.append(f"Volume {ind_h['vol_ratio_6h']}x normal in last 6h")
+    # if abs(ch24h) < 8 and abs(ch3h) < 4:
+    #     score += 20; conf += 1
+    #     reasons.append("Price quiet — volume moved first (early signal)")
+    # if float(ind_h.get("obv_trend") or 0) > 10:
+    #     score += 15; conf += 1
+    #     reasons.append(f"OBV rising {ind_h['obv_trend']:.1f}% — real buyers")
+    # if rsi_h and float(rsi_h) < 60:
+    #     score += 8; reasons.append(f"RSI {rsi_h} — room to move up")
+    # if book and float(book) > 1.3:
+    #     score += 10; conf += 1; reasons.append(f"Buy orders stacking ({book}x)")
+    # if ind_h.get("macd_crossed"):
+    #     score += 12; conf += 1; reasons.append("MACD just turned bullish")
+    # if mtf >= 3:
+    #     score += mtf_bonus; conf += 1; reasons.append(f"MTF confirmed on {mtf}/4 timeframes")
+    # score += adx_bonus + pullback_bonus + vp_bonus
+    # if conf >= 2 and score >= 55:
+    #     signals.append({"type":"EARLY VOLUME","icon":"⚡","score":score,"conf":conf,
+    #                     "reasons":reasons,"timeframe":"Hours to 1 day","early_score":min(96,80+score//5)})
 
     # SIGNAL 2: REVERSAL
     score, conf, reasons = 0, 0, []

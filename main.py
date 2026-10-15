@@ -1,5 +1,6 @@
 """
-MarketPulse Python Backend — Final Version v4
+MarketPulse Python Backend — Final Version v5
+FIX: BTC check -2% (was -5%)
 """
 
 import asyncio
@@ -11,7 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from scanner import full_scan, scan_single, get_btc_health
-import real_trading as rt
 from backtester import backtest_symbol
 from ml_scorer import MLScorer
 import paper_trading as pt
@@ -29,17 +29,16 @@ scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting MarketPulse backend v4")
+    log.info("Starting MarketPulse backend v5")
     asyncio.create_task(refresh_cache())
     asyncio.create_task(pt.monitor_loop())
-    asyncio.create_task(rt.monitor_real_trades())
     scheduler.add_job(refresh_cache, "interval", minutes=5, id="auto_scan")
     scheduler.start()
     yield
     scheduler.shutdown()
 
 
-app = FastAPI(title="MarketPulse API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="MarketPulse API", version="5.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,10 +59,10 @@ async def refresh_cache():
             except:
                 r["ml_score"] = {"probability": 50, "grade": "C", "note": ""}
 
-            if r.get("verdict") == "STRONG_BUY" and float(r.get("confidence", 0)) >= 88:
+            if r.get("verdict") == "STRONG_BUY" and float(r.get("confidence", 0)) >= 92:
                 try:
                     btc_change = await pt.get_btc_change()
-                    if btc_change > -5.0:
+                    if btc_change > -2.0:    # FIX: was -5.0
                         trade = await pt.auto_buy(r)
                         if trade:
                             log.info(f"Paper trade opened: {r['name']} @ {r['price']}")
@@ -81,7 +80,7 @@ async def refresh_cache():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.0.0", "signals": len(cached_results)}
+    return {"status": "ok", "version": "5.0.0", "signals": len(cached_results)}
 
 
 @app.get("/health")
@@ -190,39 +189,4 @@ async def paper_sell(trade_id: str):
     result = pt.auto_sell(trade_id, price, "MANUAL")
     if not result:
         raise HTTPException(500, "Sell failed")
-    return result
-
-
-# ── REAL TRADING ENDPOINTS ────────────────────────────────────
-
-@app.get("/real/stats")
-def real_stats():
-    return rt.get_real_stats()
-
-@app.get("/real/balance")
-async def real_balance():
-    return await rt.get_account_balance()
-
-@app.post("/real/toggle")
-def real_toggle(enabled: bool = True):
-    return rt.toggle_real_trading(enabled)
-
-@app.post("/real/stop")
-def real_stop():
-    return rt.emergency_stop()
-
-@app.post("/real/approve/{signal_id}")
-async def real_approve(signal_id: str, invest_inr: float = 500):
-    invest_usd = round(invest_inr / 84, 2)
-    return await rt.approve_signal(signal_id, invest_usd)
-
-@app.post("/real/reject/{signal_id}")
-def real_reject(signal_id: str):
-    return rt.reject_signal(signal_id)
-
-@app.post("/real/sell/{trade_id}")
-async def real_sell(trade_id: str):
-    result = await rt.close_real_trade(trade_id, "MANUAL")
-    if not result or "error" in result:
-        raise HTTPException(500, result.get("error","Sell failed") if result else "Sell failed")
     return result
