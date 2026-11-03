@@ -29,7 +29,7 @@ DAILY_PROFIT_LOCK = 500.0     # Stop trading for the day after ₹500 profit
 MAX_LOSS_STREAK   = 3         # Pause after 3 consecutive losses
 PAUSE_HOURS       = 6         # Pause duration after loss streak
 SIGNAL_MAX_AGE    = 30        # Signal must be < 30 min old
-MIN_SIGNALS       = 2         # Need at least 2 signal types
+MIN_SIGNALS       = 3         # FIX: Need at least 3 signal types (was 2)
 
 BINANCE_REST = "https://api.binance.com/api/v3"
 

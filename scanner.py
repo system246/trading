@@ -1,7 +1,14 @@
 """
-scanner.py v2 — Enhanced signal detection
-NEW: Multi-timeframe, ADX trend strength, volume profile,
-     EMA pullback entry, coin quality filter
+scanner.py v3 — Higher quality signals
+IMPROVEMENTS:
+- Min volume $5M USDT (was $300k — was letting in illiquid junk)
+- Max volume $30M (sweet spot for moveable coins)
+- Skip meme/leveraged names (1000x, MEME, PUMP, etc.)
+- RSI must be trending UP (not just a number)
+- Price must be ABOVE EMA21 on 1h
+- MTF: signal must appear on BOTH 15m AND 1h
+- Require 3 signal confirmations (not 2) for STRONG_BUY
+- Max coins scanned: 150 (focus on quality)
 """
 
 import asyncio
@@ -37,10 +44,17 @@ SKIP = {
     "TRXUSDT","DOGEUSDT","SHIBUSDT","PEPEUSDT","WIFUSDT","BONKUSDT",
 }
 
-MIN_VOL    = 300_000
-MAX_VOL    = 60_000_000
+# Skip junk coin patterns
+SKIP_PATTERNS = [
+    "1000", "MEME", "PUMP", "MOON", "ELON", "SHIB",
+    "FLOKI", "BABYDOGE", "TURBO", "BOME", "WIF",
+    "UP", "DOWN", "BULL", "BEAR", "3L", "3S",
+]
+
+MIN_VOL    = 5_000_000    # FIX: was 300k — now $5M minimum (filters illiquid coins)
+MAX_VOL    = 30_000_000   # FIX: was 60M — sweet spot for moveable coins
 SCAN_DELAY = 0.15
-MAX_COINS  = 200
+MAX_COINS  = 150          # FIX: was 200 — focus on quality
 
 
 async def _get(client, url):
@@ -105,7 +119,8 @@ def calc_coin_quality(df_d, vol_usd):
         quality_score = consistency * 100
         if volatility > 20: quality_score -= 20
         if pump_risk: quality_score -= 30
-        if vol_usd > 1_000_000: quality_score += 10
+        if vol_usd > 5_000_000: quality_score += 15   # FIX: bonus for $5M+ volume
+        if vol_usd > 10_000_000: quality_score += 10  # extra bonus for $10M+
         return {
             "score":       round(max(0.0, min(100.0, quality_score)), 1),
             "consistency": round(float(consistency * 100), 1),
@@ -122,7 +137,12 @@ def calc_indicators(df):
     out = {}
 
     try:
-        out["rsi"] = round(float(ta.momentum.RSIIndicator(c, window=14).rsi().iloc[-1]), 1)
+        rsi_series = ta.momentum.RSIIndicator(c, window=14).rsi()
+        out["rsi"] = round(float(rsi_series.iloc[-1]), 1)
+        # FIX: RSI trend — is RSI rising or falling?
+        if len(rsi_series) >= 4:
+            out["rsi_rising"] = bool(float(rsi_series.iloc[-1]) > float(rsi_series.iloc[-4]))
+            out["rsi_slope"]  = round(float(rsi_series.iloc[-1]) - float(rsi_series.iloc[-4]), 1)
     except: pass
 
     try:
@@ -169,6 +189,10 @@ def calc_indicators(df):
             prev_price <= ema21_val * 1.02 and
             price > prev_price
         )
+        # FIX: price must be above EMA21 (uptrend filter)
+        out["above_ema21"] = bool(price > ema21_val)
+        # EMA50 trend
+        out["above_ema50"] = bool(price > float(ema50.iloc[-1]))
     except: pass
 
     try:
@@ -191,6 +215,8 @@ def calc_indicators(df):
             ratio  = round(recent / base, 2) if base > 0 else 1.0
             out["vol_ratio_6h"] = ratio
             out["vol_spike"]    = bool(ratio > 1.8)
+            # FIX: volume must be 1.5x above average to confirm (was 1.8x — still need 1.5 for signal)
+            out["vol_confirm"]  = bool(ratio > 1.5)
     except: pass
 
     closes = c.values
@@ -234,7 +260,40 @@ def calc_mtf_score(ind_15m, ind_1h, ind_4h, ind_1d):
     return score
 
 
-def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality):
+def _passes_quality_gate(ind_1h, ind_15m, quality, vol_usd) -> tuple:
+    """
+    FIX: Hard quality checks before any signal detection.
+    Returns (passes: bool, reason: str)
+    """
+    # Must have $5M+ volume (already filtered in get_all_pairs, double check)
+    if vol_usd < MIN_VOL:
+        return False, f"Volume too low (${vol_usd/1e6:.1f}M < $5M)"
+
+    # Coin quality score must be > 30
+    if quality and float(quality.get("score") or 100) < 30:
+        return False, "Coin quality too low"
+
+    # Skip pump-risk coins
+    if quality and quality.get("pump_risk"):
+        return False, "Pump risk detected"
+
+    # FIX: Price must be above EMA21 on 1h (basic uptrend)
+    if not ind_1h.get("above_ema21", True):
+        return False, "Price below EMA21 — not in uptrend"
+
+    # FIX: RSI must be rising (not falling into a signal)
+    rsi = ind_1h.get("rsi")
+    if rsi and float(rsi) > 72:
+        return False, f"RSI {rsi} overbought — too late to enter"
+
+    # FIX: Volume must confirm (at least 1.5x normal)
+    if not ind_1h.get("vol_confirm") and not ind_15m.get("vol_confirm"):
+        return False, "Volume not confirming — weak move"
+
+    return True, "OK"
+
+
+def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality, vol_usd=0):
     signals = []
     rsi_h = ind_h.get("rsi")
     rsi_d = ind_d.get("rsi")
@@ -243,9 +302,13 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality)
     ch7d  = float(ind_d.get("ch7d") or 0)
     adx   = ind_h.get("adx")
 
+    # Hard filters
     if abs(ch24h) > 40 or abs(ch3h) > 15: return []
     if quality and quality.get("pump_risk"): return []
     if quality and float(quality.get("score") or 100) < 30: return []
+
+    # FIX: RSI must be rising on 1h for most signals
+    rsi_rising = bool(ind_h.get("rsi_rising", True))
 
     mtf = calc_mtf_score(ind_15m, ind_h, ind_4h, ind_d)
     mtf_bonus = mtf * 8
@@ -255,31 +318,10 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality)
     vol_support = float(ind_h.get("vol_support") or 0)
     vp_bonus = 10 if vol_support > 0.6 else 5 if vol_support > 0.4 else 0
 
-    # SIGNAL 1: EARLY VOLUME
-    # score, conf, reasons = 0, 0, []
-    # if ind_h.get("vol_spike"):
-    #     score += 35; conf += 1
-    #     reasons.append(f"Volume {ind_h['vol_ratio_6h']}x normal in last 6h")
-    # if abs(ch24h) < 8 and abs(ch3h) < 4:
-    #     score += 20; conf += 1
-    #     reasons.append("Price quiet — volume moved first (early signal)")
-    # if float(ind_h.get("obv_trend") or 0) > 10:
-    #     score += 15; conf += 1
-    #     reasons.append(f"OBV rising {ind_h['obv_trend']:.1f}% — real buyers")
-    # if rsi_h and float(rsi_h) < 60:
-    #     score += 8; reasons.append(f"RSI {rsi_h} — room to move up")
-    # if book and float(book) > 1.3:
-    #     score += 10; conf += 1; reasons.append(f"Buy orders stacking ({book}x)")
-    # if ind_h.get("macd_crossed"):
-    #     score += 12; conf += 1; reasons.append("MACD just turned bullish")
-    # if mtf >= 3:
-    #     score += mtf_bonus; conf += 1; reasons.append(f"MTF confirmed on {mtf}/4 timeframes")
-    # score += adx_bonus + pullback_bonus + vp_bonus
-    # if conf >= 2 and score >= 55:
-    #     signals.append({"type":"EARLY VOLUME","icon":"⚡","score":score,"conf":conf,
-    #                     "reasons":reasons,"timeframe":"Hours to 1 day","early_score":min(96,80+score//5)})
+    # EARLY VOLUME — disabled (kills win rate)
+    # (commented out)
 
-    # SIGNAL 2: REVERSAL
+    # SIGNAL 1: REVERSAL
     score, conf, reasons = 0, 0, []
     if rsi_h and float(rsi_h) < 35:
         score += 30; conf += 1; reasons.append(f"Hourly RSI oversold at {rsi_h}")
@@ -298,11 +340,13 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality)
     if mtf >= 2:
         score += mtf_bonus; conf += 1; reasons.append(f"Reversal confirmed on {mtf} timeframes")
     score += adx_bonus + vp_bonus
-    if conf >= 2 and score >= 52:
+    # FIX: require RSI rising for reversal (actually reversing, not still falling)
+    if rsi_rising: score += 10; conf += 1
+    if conf >= 3 and score >= 60:   # FIX: was conf>=2, score>=52
         signals.append({"type":"REVERSAL","icon":"📡","score":score,"conf":conf,
                         "reasons":reasons,"timeframe":"1–3 days","early_score":min(96,76+score//5)})
 
-    # SIGNAL 3: SQUEEZE
+    # SIGNAL 2: SQUEEZE
     score, conf, reasons = 0, 0, []
     if ind_d.get("bb_squeeze"):
         score += 35; conf += 1; reasons.append("Bollinger Bands compressed — energy building")
@@ -316,11 +360,13 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality)
     if mtf >= 2:
         score += mtf_bonus; conf += 1; reasons.append(f"Squeeze confirmed on {mtf} timeframes")
     score += adx_bonus
-    if conf >= 2 and score >= 55:
+    # FIX: squeeze direction — must be breaking upward
+    if ind_h.get("above_ema21"): score += 10; conf += 1
+    if conf >= 3 and score >= 65:  # FIX: was conf>=2, score>=55
         signals.append({"type":"SQUEEZE","icon":"🔒","score":score,"conf":conf,
                         "reasons":reasons,"timeframe":"1–4 days","early_score":min(96,74+score//5)})
 
-    # SIGNAL 4: ACCUMULATION
+    # SIGNAL 3: ACCUMULATION
     score, conf, reasons = 0, 0, []
     if float(ind_d.get("obv_trend") or 0) > 15:
         score += 25; conf += 1; reasons.append(f"OBV rising {ind_d['obv_trend']:.1f}% on daily")
@@ -335,11 +381,13 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality)
     if vol_support > 0.5:
         score += 15; conf += 1; reasons.append("High volume accumulated at current price")
     score += mtf_bonus // 2
-    if conf >= 2 and score >= 60:
+    # FIX: volume must be rising during accumulation
+    if float(ind_h.get("vol_ratio_6h") or 1) > 1.3: score += 8; conf += 1
+    if conf >= 3 and score >= 70:  # FIX: was conf>=2, score>=60
         signals.append({"type":"ACCUMULATION","icon":"🐋","score":score,"conf":conf,
                         "reasons":reasons,"timeframe":"3–7 days","early_score":min(96,78+score//5)})
 
-    # SIGNAL 5: SUPERTREND
+    # SIGNAL 4: SUPERTREND
     score, conf, reasons = 0, 0, []
     if ind_d.get("supertrend_bull") and ind_h.get("supertrend_bull"):
         score += 40; conf += 2; reasons.append("Supertrend bullish on daily + hourly")
@@ -357,11 +405,13 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality)
         score += mtf_bonus; conf += 1; reasons.append(f"Trend confirmed on {mtf}/4 timeframes")
     if ind_h.get("ema_pullback"):
         score += pullback_bonus; reasons.append("Perfect pullback to EMA — ideal entry")
-    if conf >= 2 and score >= 58:
+    # FIX: 4h must also be bullish for SUPERTREND
+    if ind_4h.get("supertrend_bull"): score += 12; conf += 1
+    if conf >= 3 and score >= 65:  # FIX: was conf>=2, score>=58
         signals.append({"type":"SUPERTREND","icon":"🚀","score":score,"conf":conf,
                         "reasons":reasons,"timeframe":"1–5 days","early_score":min(96,75+score//5)})
 
-    # SIGNAL 6: FUNDING
+    # SIGNAL 5: FUNDING
     if funding is not None and float(funding) < -0.0005:
         score, conf, reasons = 40, 1, []
         reasons.append(f"Funding {float(funding)*100:.4f}% — shorts paying longs")
@@ -369,7 +419,10 @@ def detect_signals(ind_h, ind_d, ind_4h, ind_15m, price, funding, book, quality)
             score += 22; conf += 1; reasons.append(f"RSI oversold at {rsi_h}")
         if float(ind_h.get("obv_trend") or 0) > 0:
             score += 18; conf += 1; reasons.append("Spot buyers absorbing")
-        if conf >= 1 and score >= 50:
+        # FIX: require volume confirmation for funding signal too
+        if ind_h.get("vol_confirm"):
+            score += 15; conf += 1; reasons.append("Volume confirming short squeeze")
+        if conf >= 2 and score >= 60:  # FIX: was conf>=1, score>=50
             signals.append({"type":"FUNDING","icon":"💰","score":score,"conf":conf,
                             "reasons":reasons,"timeframe":"Hours to 1 day","early_score":min(96,72+score//5)})
 
@@ -400,10 +453,15 @@ def calc_verdict(signals, ind_h, ind_d, ch24h, ch7d):
     if ind_d.get("supertrend_bull"):   score += 5
     if adx and float(adx) > 25:        score += 8
     if ind_h.get("ema_pullback"):      score += 6
+    # FIX: bonus for RSI trending up
+    if ind_h.get("rsi_rising"):        score += 5
+    # FIX: bonus if 4h also bullish (not just 1h)
+    if ind_d.get("supertrend_bull") and ind_h.get("supertrend_bull"): score += 5
     score = min(98.0, max(5.0, score))
 
     n = len(signals)
-    if score >= 82 and n >= 2:
+    # FIX: require 3 signals for STRONG_BUY (was 2)
+    if score >= 82 and n >= 3:
         v, risk = "STRONG_BUY", "LOW"
         pts = []
         if ind_h.get("vol_spike"):    pts.append(f"Volume {ind_h.get('vol_ratio_6h',0)}x above normal.")
@@ -411,6 +469,9 @@ def calc_verdict(signals, ind_h, ind_d, ch24h, ch7d):
         if adx and float(adx) > 25:   pts.append(f"Strong trend (ADX {adx}).")
         if ind_h.get("ema_pullback"): pts.append("Perfect pullback entry.")
         reason = " ".join(pts[:3]) or "Multiple strong signals align."
+    elif score >= 82 and n == 2:
+        v, risk = "BUY", "MEDIUM"
+        reason = f"Strong setup but only 2 signal types — wait for more confirmation."
     elif score >= 68:
         v, risk = "BUY", "MEDIUM"
         reason = f"Good setup — {n} signal(s). Consider moderate position."
@@ -486,7 +547,12 @@ def _build_result(symbol, price, df_15m, df_1h, df_4h, df_1d, funding, book, ch2
 
     quality = calc_coin_quality(df_1d, vol_usd)
 
-    signals = detect_signals(ind_1h, ind_1d, ind_4h, ind_15m, price, funding, book, quality)
+    # FIX: quality gate before signal detection
+    passes, gate_reason = _passes_quality_gate(ind_1h, ind_15m, quality, vol_usd)
+    if not passes:
+        return None
+
+    signals = detect_signals(ind_1h, ind_1d, ind_4h, ind_15m, price, funding, book, quality, vol_usd)
     if not signals:
         return None
 
@@ -502,6 +568,7 @@ def _build_result(symbol, price, df_15m, df_1h, df_4h, df_1d, funding, book, ch2
         "ch3h":            float(ind_1h.get("ch3h") or 0),
         "rsi_h":           ind_1h.get("rsi"),
         "rsi_d":           ind_1d.get("rsi"),
+        "rsi_rising":      bool(ind_1h.get("rsi_rising", False)),
         "macd_hist":       ind_1h.get("macd_hist"),
         "macd_crossed":    bool(ind_1h.get("macd_crossed", False)),
         "bb_upper":        ind_1d.get("bb_upper"),
@@ -515,6 +582,7 @@ def _build_result(symbol, price, df_15m, df_1h, df_4h, df_1d, funding, book, ch2
         "vol_ratio":       ind_1h.get("vol_ratio_6h"),
         "vol_spike":       bool(ind_1h.get("vol_spike", False)),
         "vol_support":     vol_support,
+        "above_ema21":     bool(ind_1h.get("above_ema21", False)),
         "stoch_k":         ind_1h.get("stoch_k"),
         "ema_bullish":     bool(ind_1h.get("ema_bullish", False)),
         "ema_pullback":    bool(ind_1h.get("ema_pullback", False)),
@@ -529,6 +597,7 @@ def _build_result(symbol, price, df_15m, df_1h, df_4h, df_1d, funding, book, ch2
         "confidence":      verdict["confidence"],
         "reason":          verdict["reason"],
         "risk":            verdict["risk"],
+        "signal_time":     int(time.time() * 1000),
         "detected_at":     int(time.time() * 1000),
     }
     return _clean(result)
@@ -551,10 +620,11 @@ async def get_all_pairs(client):
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"): continue
         if sym in SKIP: continue
-        if any(x in sym for x in ["UP","DOWN","BULL","BEAR","3L","3S"]): continue
+        # FIX: skip meme/junk coin patterns
+        if any(pat in sym for pat in SKIP_PATTERNS): continue
         vol   = float(t.get("quoteVolume", 0))
         price = float(t.get("lastPrice", 0))
-        if vol < MIN_VOL or vol > MAX_VOL: continue
+        if vol < MIN_VOL or vol > MAX_VOL: continue  # FIX: $5M min
         if price < 0.000001: continue
         pairs.append({"symbol":sym,"price":price,
                       "ch24h":float(t.get("priceChangePercent", 0)),

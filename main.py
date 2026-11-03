@@ -62,7 +62,7 @@ async def refresh_cache():
             if r.get("verdict") == "STRONG_BUY" and float(r.get("confidence", 0)) >= 92:
                 try:
                     btc_change = await pt.get_btc_change()
-                    if btc_change > -2.0:    # FIX: was -5.0
+                    if btc_change > -3.5:    # FIX: -3.5% (was -2.0 too tight, -5.0 too loose)
                         trade = await pt.auto_buy(r)
                         if trade:
                             log.info(f"Paper trade opened: {r['name']} @ {r['price']}")
