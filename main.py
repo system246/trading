@@ -190,6 +190,20 @@ def paper_reset():
     return pt.reset_portfolio()
 
 
+@app.post("/paper/manual-buy")
+async def paper_manual_buy(body: dict):
+    """Manual paper buy — user picks the signal and amount themselves."""
+    try:
+        trade = pt.manual_buy(body)
+        if not trade:
+            raise HTTPException(400, "Buy failed — check balance or duplicate trade")
+        return trade
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post("/paper/sell/{trade_id}")
 async def paper_sell(trade_id: str):
     state = pt.get_state()

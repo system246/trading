@@ -328,6 +328,93 @@ async def auto_buy(signal: dict) -> Optional[dict]:
     return trade
 
 
+def manual_buy(body: dict) -> Optional[dict]:
+    """
+    Manual paper buy — user chose the signal themselves.
+    Same tracking as auto_buy but skips confidence/signal filters.
+    """
+    state = _load()
+    _reset_daily_if_needed(state)
+
+    symbol = str(body.get("symbol", "")).upper()
+    if not symbol: return None
+
+    # Check balance and duplicate
+    if symbol in [t["symbol"] for t in state["open_trades"]]: return None
+    if len(state["open_trades"]) >= MAX_OPEN_TRADES + 2: return None  # allow 2 extra for manual
+
+    invest = float(body.get("invest", 0))
+    if invest < 100 or invest > float(state["balance"]): return None
+
+    price        = float(body.get("price", 0))
+    if price <= 0: return None
+
+    target_price = round(price * (1 + TAKE_PROFIT_PCT), 8)
+    stop_price   = round(price * (1 - STOP_LOSS_PCT), 8)
+    qty          = round(invest / price, 8)
+    max_hold_ms  = int(time.time() * 1000) + int(MAX_HOLD_DAYS * 24 * 3600 * 1000)
+
+    signals_list = body.get("signals", []) or []
+    signal_type  = body.get("signal_type", "") or (signals_list[0].get("type","") if signals_list else "MANUAL")
+
+    trade = {
+        "id":             f"MPT_{symbol}_{int(time.time())}",
+        "symbol":         symbol,
+        "name":           str(body.get("name", symbol.replace("USDT",""))),
+        "entry_price":    price,
+        "current_price":  price,
+        "peak_price":     price,
+        "target_price":   target_price,
+        "stop_price":     stop_price,
+        "initial_stop":   stop_price,
+        "qty":            qty,
+        "invested":       invest,
+        "current_value":  invest,
+        "pnl":            0.0,
+        "pnl_pct":        0.0,
+        "confidence":     float(body.get("confidence", 0)),
+        "signal_type":    signal_type,
+        "reason":         str(body.get("reason", "Manual buy")),
+        "status":         "OPEN",
+        "opened_at":      int(time.time() * 1000),
+        "max_hold_until": max_hold_ms,
+        "closed_at":      None,
+        "close_reason":   None,
+        "trailing":       True,
+        "manual":         True,   # flag so we can show it differently in UI
+        # ML features
+        "ch3h":           body.get("ch3h", 0),
+        "ch24h":          body.get("ch24h", 0),
+        "ch7d":           body.get("ch7d", 0),
+        "rsi_h":          body.get("rsi_h"),
+        "rsi_d":          body.get("rsi_d"),
+        "rsi_rising":     bool(body.get("rsi_rising", False)),
+        "macd_hist":      body.get("macd_hist"),
+        "macd_crossed":   bool(body.get("macd_crossed", False)),
+        "vol_ratio":      body.get("vol_ratio"),
+        "vol_spike":      bool(body.get("vol_spike", False)),
+        "supertrend_bull":bool(body.get("supertrend_bull", False)),
+        "ema_bullish":    bool(body.get("ema_bullish", False)),
+        "ema_pullback":   bool(body.get("ema_pullback", False)),
+        "above_ema21":    bool(body.get("above_ema21", False)),
+        "bb_width":       body.get("bb_width"),
+        "bb_squeeze":     bool(body.get("bb_squeeze", False)),
+        "obv_trend":      body.get("obv_trend"),
+        "adx":            body.get("adx"),
+        "stoch_k":        body.get("stoch_k"),
+        "mtf_score":      body.get("mtf_score"),
+        "book":           body.get("book"),
+        "funding":        body.get("funding"),
+        "vol_support":    body.get("vol_support"),
+        "quality":        body.get("quality"),
+    }
+
+    state["balance"] = round(float(state["balance"]) - invest, 2)
+    state["open_trades"].append(trade)
+    _save(state)
+    return trade
+
+
 def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict]:
     state = _load()
     _reset_daily_if_needed(state)
