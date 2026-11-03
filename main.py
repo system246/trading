@@ -157,7 +157,20 @@ async def btc_status():
 @app.get("/paper/stats")
 def paper_stats():
     try:
-        return pt.get_stats()
+        stats = pt.get_stats()
+        try:
+            stats["ml"] = scorer.get_model_stats()
+        except:
+            pass
+        return stats
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/paper/ml")
+def ml_status():
+    try:
+        return scorer.get_model_stats()
     except Exception as e:
         raise HTTPException(500, str(e))
 

@@ -10,6 +10,18 @@ import httpx
 import os
 from typing import Optional
 
+# ML scorer — imported lazily to avoid circular imports
+_ml_scorer = None
+def _get_ml():
+    global _ml_scorer
+    if _ml_scorer is None:
+        try:
+            from ml_scorer import MLScorer
+            _ml_scorer = MLScorer()
+        except Exception as e:
+            print(f"ML import error: {e}")
+    return _ml_scorer
+
 PAPER_FILE        = "paper_trades.json"
 STARTING_BALANCE  = 20000.0
 MAX_PER_TRADE     = 0.10
@@ -283,6 +295,31 @@ async def auto_buy(signal: dict) -> Optional[dict]:
         "closed_at":      None,
         "close_reason":   None,
         "trailing":       True,
+        # Save signal features for ML training later
+        "ch3h":           float(signal.get("ch3h") or 0),
+        "ch24h":          float(signal.get("ch24h") or 0),
+        "ch7d":           float(signal.get("ch7d") or 0),
+        "rsi_h":          signal.get("rsi_h"),
+        "rsi_d":          signal.get("rsi_d"),
+        "rsi_rising":     bool(signal.get("rsi_rising", False)),
+        "macd_hist":      signal.get("macd_hist"),
+        "macd_crossed":   bool(signal.get("macd_crossed", False)),
+        "vol_ratio":      signal.get("vol_ratio"),
+        "vol_spike":      bool(signal.get("vol_spike", False)),
+        "supertrend_bull":bool(signal.get("supertrend_bull", False)),
+        "ema_bullish":    bool(signal.get("ema_bullish", False)),
+        "ema_pullback":   bool(signal.get("ema_pullback", False)),
+        "above_ema21":    bool(signal.get("above_ema21", False)),
+        "bb_width":       signal.get("bb_width"),
+        "bb_squeeze":     bool(signal.get("bb_squeeze", False)),
+        "obv_trend":      signal.get("obv_trend"),
+        "adx":            signal.get("adx"),
+        "stoch_k":        signal.get("stoch_k"),
+        "mtf_score":      signal.get("mtf_score"),
+        "book":           signal.get("book"),
+        "funding":        signal.get("funding"),
+        "vol_support":    signal.get("vol_support"),
+        "quality":        signal.get("quality"),
     }
 
     state["balance"] = round(float(state["balance"]) - invest, 2)
@@ -350,6 +387,15 @@ def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict
     state["recent_symbols"][trade["symbol"]] = int(time.time() * 1000)
 
     _save(state)
+
+    # Trigger ML retraining check after every closed trade
+    try:
+        ml = _get_ml()
+        if ml:
+            ml.maybe_retrain()
+    except Exception as e:
+        print(f"ML retrain error: {e}")
+
     return trade
 
 
