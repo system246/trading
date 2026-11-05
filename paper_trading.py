@@ -501,7 +501,7 @@ async def monitor_loop():
 
             if state["open_trades"]:
                 btc_change = await get_btc_change()
-                market_bad = btc_change < -2.0    # FIX: was -5.0
+                market_bad = btc_change < -3.5    # FIX: -3.5% threshold (was -2.0 too tight)
 
                 for trade in list(state["open_trades"]):
                     price = await get_live_price(trade["symbol"])
@@ -516,14 +516,18 @@ async def monitor_loop():
                     # How long have we held this trade?
                     hold_h = (int(time.time() * 1000) - trade["opened_at"]) / 3600000
 
+                    # FIX: calc trailing stop BEFORE updating peak so it uses
+                    # the current price to advance the peak properly
                     new_stop, new_peak = _calc_trailing_stop(trade, price)
 
+                    # FIX: always persist peak_price and stop_price so
+                    # trailing stop never forgets the highest price seen
                     trade["current_price"] = price
                     trade["current_value"] = round(qty * price, 2)
                     trade["pnl"]           = round(trade["current_value"] - invested, 2)
                     trade["pnl_pct"]       = round(trade["pnl"] / invested * 100, 2)
-                    trade["peak_price"]    = new_peak
-                    trade["stop_price"]    = new_stop
+                    trade["peak_price"]    = new_peak   # always save new peak
+                    trade["stop_price"]    = new_stop   # always save updated stop
 
                     close_reason = None
                     drop_pct     = (entry - price) / entry  # positive = drop
@@ -537,25 +541,26 @@ async def monitor_loop():
                     elif price >= float(trade["target_price"]):
                         close_reason = "TAKE_PROFIT"
 
-                    # Stop loss / trailing — FIX: respect min hold time
+                    # Stop loss / trailing
+                    # FIX: fire immediately on severe drop (>5%) regardless of hold time
+                    # otherwise wait MIN_HOLD_HOURS so normal volatility doesn't stop us out
                     elif price <= new_stop:
-                        # Fire immediately if severe drop (> 5%) regardless of hold time
-                        # Otherwise wait MIN_HOLD_HOURS before firing
                         if drop_pct >= 0.05 or hold_h >= MIN_HOLD_HOURS:
-                            peak = float(trade.get("peak_price", price))
-                            if peak > entry * (1 + BREAKEVEN_PCT):
+                            # FIX: use new_peak (already updated) not stale trade field
+                            if new_peak > entry * (1 + BREAKEVEN_PCT):
                                 close_reason = "TRAILING_STOP"
                             else:
                                 close_reason = "STOP_LOSS"
 
-                    # BTC market crash — FIX: now -2% triggers (was -5%)
+                    # BTC market crash — FIX: -3.5% threshold (not -2.0)
                     elif market_bad:
-                        close_reason = "MARKET_CRASH"
+                        if hold_h >= MIN_HOLD_HOURS:   # FIX: don't BTC-crash exit in first 2h
+                            close_reason = "MARKET_CRASH"
 
                     if close_reason:
                         auto_sell(trade["id"], price, close_reason)
                     else:
-                        _save(state)
+                        _save(state)   # save updated peak/stop even if no close
 
                     await asyncio.sleep(0.5)
 
