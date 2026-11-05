@@ -221,6 +221,105 @@ async def paper_sell(trade_id: str):
     return result
 
 
+@app.get("/paper/regime")
+async def market_regime():
+    """#2: Current market regime — BULL/BEAR/NEUTRAL/OVERBOUGHT."""
+    try:
+        return await pt.get_regime_status()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/paper/report")
+async def daily_report():
+    """#5: Daily summary report — P&L, win rate, open trades, ML status."""
+    try:
+        stats = pt.get_stats()
+        ml    = scorer.get_model_stats()
+        regime = await pt.get_regime_status()
+
+        closed_today = []
+        cutoff = int(time.time() * 1000) - 86400000
+        for t in stats.get("closed_trades", []):
+            if t.get("closed_at", 0) > cutoff:
+                closed_today.append({
+                    "symbol":  t["symbol"],
+                    "pnl_pct": t.get("pnl_pct", 0),
+                    "pnl":     t.get("pnl", 0),
+                    "reason":  t.get("close_reason", ""),
+                    "status":  t.get("status", ""),
+                })
+
+        return {
+            "date":           time.strftime("%Y-%m-%d %H:%M IST"),
+            "portfolio":      stats["portfolio_value"],
+            "total_return":   stats["total_return_pct"],
+            "daily_pnl":      stats["daily_profit"],
+            "win_rate":       stats["win_rate"],
+            "total_trades":   stats["closed_count"],
+            "open_trades":    stats["open_count"],
+            "win_streak":     stats["win_streak"],
+            "loss_streak":    stats["loss_streak"],
+            "is_paused":      stats["is_paused"],
+            "net_after_tax":  stats["net_after_tax"],
+            "market_regime":  regime["regime"],
+            "regime_reason":  regime.get("reason", ""),
+            "ml_mode":        ml.get("mode", "RULES"),
+            "ml_samples":     ml.get("n_samples", 0),
+            "blacklisted":    ml.get("blacklist_count", 0),
+            "closed_today":   closed_today,
+            "open_positions": stats.get("open_trades", []),
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/paper/validate-real")
+async def validate_real_trade(symbol: str, amount: float, real_balance: float = 10000.0):
+    """#9: Safety check before placing a real money trade."""
+    return pt.validate_real_trade(symbol, amount, real_balance)
+
+
+@app.get("/paper/backtest-validate")
+async def backtest_validate(symbol: str, days: int = 90):
+    """
+    #8: Validate a coin against current paper trading settings.
+    Runs backtest with STOP=2.5%, TARGET=8%, TRAILING=2.5% and returns
+    whether this coin would be profitable with current settings.
+    """
+    sym = symbol.upper()
+    if not sym.endswith("USDT"):
+        sym += "USDT"
+    try:
+        from backtester import backtest_symbol
+        result = await backtest_symbol(sym, min(max(days, 30), 180))
+        if not result:
+            raise HTTPException(404, f"Not enough data for {sym}")
+
+        # Verdict: is this coin worth trading?
+        win_rate   = float(result.get("win_rate", 0))
+        avg_profit = float(result.get("avg_profit_pct", 0))
+        total_ret  = float(result.get("total_return_pct", 0))
+
+        if win_rate >= 45 and avg_profit > 2.0 and total_ret > 0:
+            verdict = "GOOD"
+            advice  = "Coin performs well with current settings"
+        elif win_rate >= 35 and total_ret > -5:
+            verdict = "MARGINAL"
+            advice  = "Borderline — monitor closely"
+        else:
+            verdict = "AVOID"
+            advice  = f"Win rate {win_rate}% too low — scanner should skip this coin"
+
+        result["backtest_verdict"] = verdict
+        result["backtest_advice"]  = advice
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 # ── REAL TRADING ──────────────────────────────────────────────
 
 @app.get("/real/stats")

@@ -27,21 +27,28 @@ STARTING_BALANCE  = 20000.0
 MAX_PER_TRADE     = 0.10
 MAX_OPEN_TRADES   = 3
 MIN_CONFIDENCE    = 92
-TAKE_PROFIT_PCT   = 0.05
-STOP_LOSS_PCT     = 0.03
-MAX_HOLD_DAYS     = 1.5
+TAKE_PROFIT_PCT   = 0.08      # #1: raised to 8% (trailing captures whatever it gives)
+STOP_LOSS_PCT     = 0.025     # #9: tighter stop — risk only 2.5%
+MAX_HOLD_DAYS     = 3.0       # #3: allow up to 3 days if still trending
+FLAT_EXIT_HOURS   = 8         # #3: exit if coin flat for 8h (no movement)
+FLAT_PCT          = 0.005     # #3: "flat" = less than 0.5% move from entry in 8h
 REENTRY_HOURS     = 24
 CHECK_INTERVAL    = 15        # 15-second checks
-TRAILING_PCT      = 0.02      # 2% trailing stop
-BREAKEVEN_PCT     = 0.04      # FIX: was 0.02 — trailing only after +4%
-MIN_HOLD_HOURS    = 2         # FIX: don't fire stop within first 2h (unless drop > 5%)
+TRAILING_PCT      = 0.025     # slightly wider trail — more room to breathe
+BREAKEVEN_PCT     = 0.03      # lock breakeven after +3% (was 4%)
+PARTIAL_EXIT_PCT  = 0.05      # #1: sell 50% of position at +5%
+MIN_HOLD_HOURS    = 2         # don't fire stop within first 2h (unless drop > 5%)
 TDS_PCT           = 0.01      # 1% TDS on sell (reality check)
 INCOME_TAX_PCT    = 0.30      # 30% income tax on profit
 DAILY_PROFIT_LOCK = 500.0     # Stop trading for the day after ₹500 profit
 MAX_LOSS_STREAK   = 3         # Pause after 3 consecutive losses
 PAUSE_HOURS       = 6         # Pause duration after loss streak
 SIGNAL_MAX_AGE    = 30        # Signal must be < 30 min old
-MIN_SIGNALS       = 3         # FIX: Need at least 3 signal types (was 2)
+MIN_SIGNALS       = 3         # Need at least 3 signal types
+SIGNAL_COOLDOWN_H = 4         # #7: don't re-signal same coin for 4h after a loss
+# #9: Real trade safety limits
+MAX_REAL_POSITION_PCT = 0.02  # never risk more than 2% of real balance per trade
+MAX_REAL_TRADES       = 2     # max concurrent real trades (conservative)
 
 BINANCE_REST = "https://api.binance.com/api/v3"
 
@@ -153,6 +160,90 @@ async def get_btc_change() -> float:
     return 0.0
 
 
+async def get_market_regime() -> dict:
+    """
+    #2: Market regime filter — only trade in uptrending markets.
+    Checks BTC 4h RSI + 20-day MA. Returns regime info for ML feature too.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # BTC 4h candles (last 60 = 10 days)
+            r4h = await client.get(
+                f"{BINANCE_REST}/klines?symbol=BTCUSDT&interval=4h&limit=60"
+            )
+            # BTC daily candles (last 25 = MA20)
+            r1d = await client.get(
+                f"{BINANCE_REST}/klines?symbol=BTCUSDT&interval=1d&limit=25"
+            )
+        if r4h.status_code != 200 or r1d.status_code != 200:
+            return {"regime": "UNKNOWN", "tradeable": True, "reason": "data_error"}
+
+        closes_4h = [float(k[4]) for k in r4h.json()]
+        closes_1d = [float(k[4]) for k in r1d.json()]
+
+        price     = closes_4h[-1]
+        ma20      = sum(closes_1d[-20:]) / 20
+
+        # Simple RSI on 4h
+        gains  = [max(closes_4h[i]-closes_4h[i-1], 0) for i in range(1, len(closes_4h))]
+        losses = [max(closes_4h[i-1]-closes_4h[i], 0) for i in range(1, len(closes_4h))]
+        ag = sum(gains[-14:]) / 14
+        al = sum(losses[-14:]) / 14
+        rsi_4h = round(100 - (100 / (1 + ag/al)), 1) if al > 0 else 50.0
+
+        above_ma20   = price > ma20
+        rsi_bullish  = rsi_4h > 45   # not oversold/neutral-bullish
+        rsi_overbought = rsi_4h > 75  # don't chase overbought
+
+        if above_ma20 and rsi_bullish and not rsi_overbought:
+            regime    = "BULL"
+            tradeable = True
+            reason    = f"BTC above MA20, RSI {rsi_4h}"
+        elif rsi_overbought:
+            regime    = "OVERBOUGHT"
+            tradeable = False          # don't buy tops
+            reason    = f"BTC RSI {rsi_4h} — overbought, wait for pullback"
+        elif not above_ma20:
+            regime    = "BEAR"
+            tradeable = False
+            reason    = f"BTC below 20-day MA — downtrend"
+        else:
+            regime    = "NEUTRAL"
+            tradeable = True           # allow in neutral, scanner will filter
+            reason    = f"BTC neutral, RSI {rsi_4h}"
+
+        return {
+            "regime":    regime,
+            "tradeable": tradeable,
+            "reason":    reason,
+            "btc_price": price,
+            "ma20":      round(ma20, 2),
+            "rsi_4h":    rsi_4h,
+            "above_ma20": above_ma20,
+        }
+    except Exception as e:
+        print(f"Market regime error: {e}")
+        return {"regime": "UNKNOWN", "tradeable": True, "reason": str(e)}
+
+
+def _is_signal_on_cooldown(symbol: str, state: dict) -> bool:
+    """
+    #7: Duplicate signal filter — if coin closed as LOSS recently,
+    don't trade it again for SIGNAL_COOLDOWN_H hours.
+    """
+    recent = state.get("recent_symbols", {})
+    info   = recent.get(symbol, {})
+    if isinstance(info, (int, float)):
+        # Legacy format — just a timestamp, no loss info
+        return False
+    last_loss_at = info.get("last_loss_at", 0)
+    if last_loss_at:
+        hours_since = (time.time() * 1000 - last_loss_at) / 3600000
+        if hours_since < SIGNAL_COOLDOWN_H:
+            return True
+    return False
+
+
 async def get_live_price(symbol: str) -> Optional[float]:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -219,6 +310,12 @@ async def auto_buy(signal: dict) -> Optional[dict]:
 
     symbol = signal["symbol"]
 
+    # #2: Market regime filter — skip if BTC in downtrend or overbought
+    regime = await get_market_regime()
+    if not regime.get("tradeable", True):
+        print(f"Skip {symbol} — market regime: {regime.get('reason','')}")
+        return None
+
     # Correlation filter — no 2 similar coins open
     for open_trade in state["open_trades"]:
         if _similar_symbol(open_trade["symbol"], symbol):
@@ -230,9 +327,15 @@ async def auto_buy(signal: dict) -> Optional[dict]:
     if len(state["open_trades"]) >= MAX_OPEN_TRADES:
         return None
 
-    # Re-entry cooldown
-    recent      = state.get("recent_symbols", {})
-    last_closed = recent.get(symbol, 0)
+    # #7: Duplicate/cooldown filter — skip if coin lost recently
+    if _is_signal_on_cooldown(symbol, state):
+        print(f"Skip {symbol} — on loss cooldown ({SIGNAL_COOLDOWN_H}h)")
+        return None
+
+    # Re-entry cooldown (24h after any close)
+    recent = state.get("recent_symbols", {})
+    info   = recent.get(symbol, {})
+    last_closed = info.get("last_closed_at", 0) if isinstance(info, dict) else info
     hours_since = (time.time() * 1000 - last_closed) / 3600000
     if last_closed > 0 and hours_since < REENTRY_HOURS:
         return None
@@ -471,9 +574,21 @@ def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict
     state["balance"]      = round(float(state["balance"]) + net_sell, 2)
     state["total_profit"] = round(float(state.get("total_profit", 0)) + pnl, 2)
 
+    # #7: Track last close + last loss per coin for duplicate/cooldown filter
     if "recent_symbols" not in state:
         state["recent_symbols"] = {}
-    state["recent_symbols"][trade["symbol"]] = int(time.time() * 1000)
+    sym_info = {
+        "last_closed_at": int(time.time() * 1000),
+        "last_status":    trade["status"],
+    }
+    if trade["status"] == "LOSS":
+        sym_info["last_loss_at"] = int(time.time() * 1000)
+    else:
+        # Keep old loss time if it existed
+        old = state["recent_symbols"].get(trade["symbol"], {})
+        if isinstance(old, dict):
+            sym_info["last_loss_at"] = old.get("last_loss_at", 0)
+    state["recent_symbols"][trade["symbol"]] = sym_info
 
     _save(state)
 
@@ -488,12 +603,46 @@ def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict
     return trade
 
 
+def _do_partial_exit(trade: dict, current_price: float, state: dict) -> bool:
+    """
+    #1: Partial exit — sell 50% at PARTIAL_EXIT_PCT (+5%).
+    Returns True if partial exit was done.
+    Only fires once per trade (partial_exited flag).
+    """
+    if trade.get("partial_exited"):
+        return False
+    entry      = float(trade["entry_price"])
+    profit_pct = (current_price - entry) / entry
+    if profit_pct < PARTIAL_EXIT_PCT:
+        return False
+
+    # Sell half the position
+    half_qty   = round(float(trade["qty"]) / 2, 8)
+    sell_value = round(half_qty * current_price, 2)
+    tds        = round(sell_value * TDS_PCT, 2)
+    net_sell   = round(sell_value - tds, 2)
+    pnl        = round(net_sell - float(trade["invested"]) / 2, 2)
+
+    # Update trade: reduce qty and invested, return half balance
+    trade["qty"]             = round(float(trade["qty"]) - half_qty, 8)
+    trade["invested"]        = round(float(trade["invested"]) / 2, 2)
+    trade["partial_exited"]  = True
+    trade["partial_exit_at"] = int(time.time() * 1000)
+    trade["partial_exit_pct"]= round(profit_pct * 100, 2)
+    trade["partial_pnl"]     = pnl
+
+    state["balance"]      = round(float(state["balance"]) + net_sell, 2)
+    state["daily_profit"] = round(state.get("daily_profit", 0) + pnl, 2)
+    state["total_profit"] = round(float(state.get("total_profit", 0)) + pnl, 2)
+
+    print(f"📊 PARTIAL EXIT {trade['symbol']} +{profit_pct*100:.1f}% — locked ₹{pnl:.0f}")
+    return True
+
+
 async def monitor_loop():
     """
     Background loop — runs every 15s.
-    FIX: BTC check at -2% (was -5%)
-    FIX: trailing only after +4% (was +2%)
-    FIX: stop loss only fires after 2h hold (unless drop > 5%)
+    Features: partial exit, market regime, flat exit, BTC crash guard.
     """
     while True:
         try:
@@ -501,7 +650,7 @@ async def monitor_loop():
 
             if state["open_trades"]:
                 btc_change = await get_btc_change()
-                market_bad = btc_change < -3.5    # FIX: -3.5% threshold (was -2.0 too tight)
+                market_bad = btc_change < -3.5
 
                 for trade in list(state["open_trades"]):
                     price = await get_live_price(trade["symbol"])
@@ -512,55 +661,59 @@ async def monitor_loop():
                     invested = float(trade["invested"])
                     qty      = float(trade["qty"])
                     entry    = float(trade["entry_price"])
+                    hold_h   = (int(time.time() * 1000) - trade["opened_at"]) / 3600000
 
-                    # How long have we held this trade?
-                    hold_h = (int(time.time() * 1000) - trade["opened_at"]) / 3600000
-
-                    # FIX: calc trailing stop BEFORE updating peak so it uses
-                    # the current price to advance the peak properly
                     new_stop, new_peak = _calc_trailing_stop(trade, price)
 
-                    # FIX: always persist peak_price and stop_price so
-                    # trailing stop never forgets the highest price seen
                     trade["current_price"] = price
                     trade["current_value"] = round(qty * price, 2)
                     trade["pnl"]           = round(trade["current_value"] - invested, 2)
                     trade["pnl_pct"]       = round(trade["pnl"] / invested * 100, 2)
-                    trade["peak_price"]    = new_peak   # always save new peak
-                    trade["stop_price"]    = new_stop   # always save updated stop
+                    trade["peak_price"]    = new_peak
+                    trade["stop_price"]    = new_stop
+
+                    # #1: Partial exit — lock profit at +5% before full exit
+                    did_partial = _do_partial_exit(trade, price, state)
+                    if did_partial:
+                        _save(state)
+                        await asyncio.sleep(0.5)
+                        continue
 
                     close_reason = None
-                    drop_pct     = (entry - price) / entry  # positive = drop
+                    drop_pct     = (entry - price) / entry
 
-                    # Time limit
+                    # Time limit (max hold days)
                     max_hold = trade.get("max_hold_until", 0)
                     if max_hold and int(time.time() * 1000) > max_hold:
                         close_reason = "TIME_LIMIT"
+
+                    # #3: Flat exit — coin going nowhere after FLAT_EXIT_HOURS
+                    elif hold_h >= FLAT_EXIT_HOURS and not trade.get("partial_exited"):
+                        move_pct = abs((price - entry) / entry)
+                        if move_pct < FLAT_PCT:
+                            close_reason = "FLAT_EXIT"
 
                     # Take profit
                     elif price >= float(trade["target_price"]):
                         close_reason = "TAKE_PROFIT"
 
                     # Stop loss / trailing
-                    # FIX: fire immediately on severe drop (>5%) regardless of hold time
-                    # otherwise wait MIN_HOLD_HOURS so normal volatility doesn't stop us out
                     elif price <= new_stop:
                         if drop_pct >= 0.05 or hold_h >= MIN_HOLD_HOURS:
-                            # FIX: use new_peak (already updated) not stale trade field
                             if new_peak > entry * (1 + BREAKEVEN_PCT):
                                 close_reason = "TRAILING_STOP"
                             else:
                                 close_reason = "STOP_LOSS"
 
-                    # BTC market crash — FIX: -3.5% threshold (not -2.0)
+                    # BTC market crash
                     elif market_bad:
-                        if hold_h >= MIN_HOLD_HOURS:   # FIX: don't BTC-crash exit in first 2h
+                        if hold_h >= MIN_HOLD_HOURS:
                             close_reason = "MARKET_CRASH"
 
                     if close_reason:
                         auto_sell(trade["id"], price, close_reason)
                     else:
-                        _save(state)   # save updated peak/stop even if no close
+                        _save(state)
 
                     await asyncio.sleep(0.5)
 
@@ -604,7 +757,11 @@ def get_stats() -> dict:
             td["locked_profit_pct"] = round((stop - entry) / entry * 100, 2)
         # Show hold time
         hold_h = (int(time.time() * 1000) - t["opened_at"]) / 3600000
-        td["hold_hours"] = round(hold_h, 1)
+        td["hold_hours"]         = round(hold_h, 1)
+        # #6: show stop price info clearly in UI
+        td["stop_price_display"] = round(float(t.get("stop_price", 0)), 6)
+        td["stop_pct_from_entry"]= round((float(t.get("stop_price",0)) - float(t.get("entry_price",1))) / float(t.get("entry_price",1)) * 100, 2)
+        td["partial_exited"]     = bool(t.get("partial_exited", False))
         open_display.append(td)
 
     return {
@@ -614,11 +771,11 @@ def get_stats() -> dict:
         "total_return_pct": total_ret,
         "total_profit":     round(total_pnl, 2),
         "total_tds":        round(total_tds, 2),
-        "total_tds_paid":   round(total_tds, 2),          # FIX: alias for frontend
+        "total_tds_paid":   round(total_tds, 2),
         "total_tax":        round(total_tax, 2),
-        "total_tax_est":    round(total_tax, 2),          # FIX: alias for frontend
+        "total_tax_est":    round(total_tax, 2),
         "net_after_tax":    round(total_pnl - total_tax, 2),
-        "total_net_profit": round(total_pnl - total_tax, 2),  # FIX: alias for frontend
+        "total_net_profit": round(total_pnl - total_tax, 2),
         "open_count":       len(open_t),
         "closed_count":     len(closed),
         "win_count":        len(wins),
@@ -635,3 +792,38 @@ def get_stats() -> dict:
         "open_trades":      open_display,
         "closed_trades":    closed[:20],
     }
+
+
+# #9: Real trade safety checks
+def validate_real_trade(symbol: str, amount: float, real_balance: float) -> dict:
+    """
+    Safety checks before placing any real money trade.
+    Returns {ok: bool, reason: str}
+    """
+    errors = []
+
+    # Never risk more than 2% of real balance per trade
+    max_allowed = real_balance * MAX_REAL_POSITION_PCT
+    if amount > max_allowed:
+        errors.append(f"Amount ₹{amount:.0f} exceeds 2% of balance (₹{max_allowed:.0f})")
+
+    # Minimum meaningful trade size
+    if amount < 100:
+        errors.append("Minimum trade size is ₹100")
+
+    # Must have a symbol
+    if not symbol or not symbol.endswith("USDT"):
+        errors.append("Invalid symbol — must end in USDT")
+
+    # Balance sanity
+    if real_balance < 500:
+        errors.append("Real balance too low — minimum ₹500 to trade safely")
+
+    if errors:
+        return {"ok": False, "reason": " | ".join(errors)}
+    return {"ok": True, "reason": "All checks passed", "max_per_trade": max_allowed}
+
+
+async def get_regime_status() -> dict:
+    """Expose market regime for dashboard display."""
+    return await get_market_regime()
