@@ -434,7 +434,8 @@ def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict
     pnl_pct       = round(pnl / float(trade["invested"]) * 100, 2)
 
     # Income tax on profit (30%)
-    tax_amount = round(max(0, pnl) * INCOME_TAX_PCT, 2)
+    tax_amount  = round(max(0, pnl) * INCOME_TAX_PCT, 2)
+    net_profit  = round(pnl - tax_amount, 2)   # FIX: actual take-home after tax
 
     trade.update({
         "current_price": current_price,
@@ -444,6 +445,7 @@ def auto_sell(trade_id: str, current_price: float, reason: str) -> Optional[dict
         "tax":           tax_amount,
         "pnl":           pnl,
         "pnl_pct":       pnl_pct,
+        "net_profit":    net_profit,             # FIX: per-trade net shown in history
         "status":        "WIN" if pnl > 0 else "LOSS",
         "closed_at":     int(time.time() * 1000),
         "close_reason":  reason,
@@ -607,8 +609,11 @@ def get_stats() -> dict:
         "total_return_pct": total_ret,
         "total_profit":     round(total_pnl, 2),
         "total_tds":        round(total_tds, 2),
+        "total_tds_paid":   round(total_tds, 2),          # FIX: alias for frontend
         "total_tax":        round(total_tax, 2),
+        "total_tax_est":    round(total_tax, 2),          # FIX: alias for frontend
         "net_after_tax":    round(total_pnl - total_tax, 2),
+        "total_net_profit": round(total_pnl - total_tax, 2),  # FIX: alias for frontend
         "open_count":       len(open_t),
         "closed_count":     len(closed),
         "win_count":        len(wins),

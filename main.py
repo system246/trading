@@ -15,6 +15,7 @@ from scanner import full_scan, scan_single, get_btc_health
 from backtester import backtest_symbol
 from ml_scorer import MLScorer
 import paper_trading as pt
+import real_trading as rt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mp")
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
     log.info("Starting MarketPulse backend v5")
     asyncio.create_task(refresh_cache())
     asyncio.create_task(pt.monitor_loop())
+    asyncio.create_task(rt.monitor_real_trades())
     scheduler.add_job(refresh_cache, "interval", minutes=5, id="auto_scan")
     scheduler.start()
     yield
@@ -217,3 +219,78 @@ async def paper_sell(trade_id: str):
     if not result:
         raise HTTPException(500, "Sell failed")
     return result
+
+
+# ── REAL TRADING ──────────────────────────────────────────────
+
+@app.get("/real/stats")
+async def real_stats():
+    try:
+        stats = await rt.get_real_stats()
+        return stats
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/real/balance")
+async def real_balance():
+    try:
+        balance = await rt.get_account_balance()
+        return balance
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/real/toggle")
+async def real_toggle(enabled: bool = True):
+    try:
+        return await rt.toggle_real_trading(enabled)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/real/emergency-stop")
+async def real_emergency_stop():
+    try:
+        return await rt.emergency_stop()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/real/approve/{signal_id}")
+async def real_approve(signal_id: str, amount: float = 1000.0):
+    try:
+        result = await rt.approve_signal(signal_id, amount)
+        if not result:
+            raise HTTPException(400, "Signal not found or already processed")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/real/reject/{signal_id}")
+async def real_reject(signal_id: str):
+    try:
+        result = await rt.reject_signal(signal_id)
+        if not result:
+            raise HTTPException(404, "Signal not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/real/sell/{trade_id}")
+async def real_sell(trade_id: str):
+    try:
+        result = await rt.close_real_trade(trade_id, "MANUAL")
+        if not result:
+            raise HTTPException(404, "Trade not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))

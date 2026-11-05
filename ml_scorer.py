@@ -25,11 +25,101 @@ except ImportError:
     SKLEARN_OK = False
     print("⚠️  sklearn not installed — pip install scikit-learn")
 
-PAPER_FILE    = "paper_trades.json"
-MODEL_FILE    = "ml_model.pkl"
-DATA_FILE     = "ml_training_data.json"
-MIN_TRADES    = 20      # need this many closed trades before ML kicks in
-RETRAIN_EVERY = 10      # retrain after every N new trades
+PAPER_FILE      = "paper_trades.json"
+MODEL_FILE      = "ml_model.pkl"
+DATA_FILE       = "ml_training_data.json"
+BLACKLIST_FILE  = "ml_blacklist.json"
+MIN_TRADES      = 20      # need this many closed trades before ML kicks in
+RETRAIN_EVERY   = 10      # retrain after every N new trades
+MIN_COIN_TRADES = 3       # need at least 3 trades on a coin before auto-blacklisting
+BLACKLIST_WINRATE = 0.20  # auto-blacklist if coin win rate < 20%
+
+
+# ── Auto-blacklist (ML learns bad coins automatically) ──────────
+
+def _load_blacklist() -> dict:
+    if os.path.exists(BLACKLIST_FILE):
+        try:
+            return json.load(open(BLACKLIST_FILE))
+        except:
+            pass
+    return {"coins": {}, "patterns": [], "updated_at": 0}
+
+
+def _save_blacklist(bl: dict):
+    bl["updated_at"] = int(time.time())
+    json.dump(bl, open(BLACKLIST_FILE, "w"), indent=2)
+
+
+def update_blacklist():
+    """
+    Automatically learn which coins/patterns consistently lose.
+    Called after each retrain. No manual work needed.
+    """
+    if not os.path.exists(PAPER_FILE):
+        return
+
+    try:
+        state = json.load(open(PAPER_FILE))
+    except:
+        return
+
+    closed = state.get("closed_trades", [])
+    if not closed:
+        return
+
+    # Count wins/losses per coin
+    coin_stats = {}
+    for t in closed:
+        sym = t.get("symbol", "").replace("USDT", "")
+        if not sym:
+            continue
+        if sym not in coin_stats:
+            coin_stats[sym] = {"wins": 0, "losses": 0, "reasons": []}
+        if t.get("status") == "WIN":
+            coin_stats[sym]["wins"] += 1
+        else:
+            coin_stats[sym]["losses"] += 1
+            coin_stats[sym]["reasons"].append(t.get("close_reason", ""))
+
+    bl = _load_blacklist()
+
+    for coin, stats in coin_stats.items():
+        total = stats["wins"] + stats["losses"]
+        if total < MIN_COIN_TRADES:
+            continue
+
+        win_rate = stats["wins"] / total
+        if win_rate < BLACKLIST_WINRATE:
+            if coin not in bl["coins"]:
+                print(f"ML AUTO-BLACKLIST: {coin} — {total} trades, {win_rate*100:.0f}% win rate")
+                bl["coins"][coin] = {
+                    "wins":     stats["wins"],
+                    "losses":   stats["losses"],
+                    "win_rate": round(win_rate, 3),
+                    "top_reason": max(set(stats["reasons"]), key=stats["reasons"].count) if stats["reasons"] else "",
+                    "blacklisted_at": int(time.time()),
+                }
+        else:
+            # Remove from blacklist if it recovers
+            if coin in bl["coins"]:
+                print(f"ML UNBLACKLIST: {coin} — recovered to {win_rate*100:.0f}% win rate")
+                del bl["coins"][coin]
+
+    _save_blacklist(bl)
+    return bl
+
+
+def get_blacklist() -> set:
+    """Return set of blacklisted coin base symbols (no USDT)."""
+    bl = _load_blacklist()
+    return set(bl.get("coins", {}).keys())
+
+
+def is_blacklisted(symbol: str) -> bool:
+    """Check if a coin symbol is ML-blacklisted."""
+    base = symbol.replace("USDT", "").replace("BUSD", "")
+    return base in get_blacklist()
 
 
 # ── Feature extraction ─────────────────────────────────────────
@@ -337,8 +427,15 @@ class MLScorer:
         """
         Call this after each trade closes.
         Automatically retrains if enough new data.
+        Also updates the auto-blacklist — no manual coin filtering needed.
         """
         n = update_training_data()
+        # Always update blacklist (even before ML activates)
+        try:
+            update_blacklist()
+        except Exception as e:
+            print(f"ML blacklist update error: {e}")
+
         if n >= MIN_TRADES and (n - self._trade_count_at_last_train) >= RETRAIN_EVERY:
             print(f"ML: auto-retraining on {n} samples…")
             success = train_model()
@@ -424,28 +521,35 @@ class MLScorer:
         wins   = sum(1 for s in td["samples"] if s["label"] == 1)
         losses = n - wins
 
+        bl = _load_blacklist()
+        blacklisted_coins = list(bl.get("coins", {}).keys())
+
         if m:
             top_features = sorted(
                 m.get("feature_importance", {}).items(),
                 key=lambda x: -x[1]
             )[:5]
             return {
-                "active":       True,
-                "mode":         "ML",
-                "n_samples":    n,
-                "wins":         wins,
-                "losses":       losses,
-                "cv_accuracy":  m.get("cv_accuracy", 0),
-                "trained_at":   m.get("trained_at", 0),
-                "top_features": top_features,
+                "active":           True,
+                "mode":             "ML",
+                "n_samples":        n,
+                "wins":             wins,
+                "losses":           losses,
+                "cv_accuracy":      m.get("cv_accuracy", 0),
+                "trained_at":       m.get("trained_at", 0),
+                "top_features":     top_features,
+                "blacklisted_coins": blacklisted_coins,
+                "blacklist_count":  len(blacklisted_coins),
             }
         else:
             return {
-                "active":    False,
-                "mode":      "RULES",
-                "n_samples": n,
-                "wins":      wins,
-                "losses":    losses,
-                "needed":    max(0, MIN_TRADES - n),
-                "note":      f"Need {max(0, MIN_TRADES - n)} more closed trades to activate ML",
+                "active":            False,
+                "mode":              "RULES",
+                "n_samples":         n,
+                "wins":              wins,
+                "losses":            losses,
+                "needed":            max(0, MIN_TRADES - n),
+                "note":              f"Need {max(0, MIN_TRADES - n)} more closed trades to activate ML",
+                "blacklisted_coins": blacklisted_coins,
+                "blacklist_count":   len(blacklisted_coins),
             }

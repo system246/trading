@@ -42,19 +42,66 @@ SKIP = {
     "LTCUSDT","LINKUSDT","ATOMUSDT","UNIUSDT","XLMUSDT","NEARUSDT",
     "APTUSDT","ALGOUSDT","VETUSDT","ICPUSDT","FILUSDT","ETCUSDT",
     "TRXUSDT","DOGEUSDT","SHIBUSDT","PEPEUSDT","WIFUSDT","BONKUSDT",
+    # Stablecoins & yield tokens
+    "BFUSDUSDT","USDEUSDT","USDDUSDT","FDUSDUSDT","USDTUSDT",
+    "FRAXUSDT","CUSDUSDT","ALUSDUSDT","SUSDUSDT","GUSDUSDT",
+    "EURCUSDT","EURUSDT","GBPUSDT","JPYUSDT",
+    # Gold / commodity tokens
+    "PAXGUSDT","XAUTUSDT","PMGOLDUSDT","DGLDUSDT",
+    # Wrapped tokens
+    "WBTCUSDT","WETHUSDT","WBNBUSDT","WSOLUSDТ","WETHEUSDT",
 }
 
-# Skip junk coin patterns
+# Skip junk coin name patterns — ML also learns its own bad coins over time
 SKIP_PATTERNS = [
+    # Meme / pump
     "1000", "MEME", "PUMP", "MOON", "ELON", "SHIB",
     "FLOKI", "BABYDOGE", "TURBO", "BOME", "WIF",
     "UP", "DOWN", "BULL", "BEAR", "3L", "3S",
+    # Leveraged tokens
+    "HEDGE", "SET", "YIELD",
+    # Stablecoin name patterns
+    "USD", "EUR", "GBP", "JPY", "AUD", "CAD",
+    # Gold / commodity patterns
+    "XAU", "GOLD", "SILVER", "OIL", "PAXG",
+    # Wrapped patterns
+    "WBTC", "WETH", "WBNB", "WSOL",
 ]
 
 MIN_VOL    = 5_000_000    # FIX: was 300k — now $5M minimum (filters illiquid coins)
 MAX_VOL    = 30_000_000   # FIX: was 60M — sweet spot for moveable coins
 SCAN_DELAY = 0.15
 MAX_COINS  = 150          # FIX: was 200 — focus on quality
+
+
+def _get_ml_blacklist() -> set:
+    """Load ML-learned bad coins from ml_blacklist.json — auto-updated after every trade."""
+    try:
+        import json as _json
+        if os.path.exists("ml_blacklist.json"):
+            bl = _json.load(open("ml_blacklist.json"))
+            return set(bl.get("coins", {}).keys())
+    except:
+        pass
+    return set()
+
+
+import os
+
+
+def _should_skip(symbol: str) -> bool:
+    """Return True if coin should be skipped — combines static list + ML-learned blacklist."""
+    base = symbol.replace("USDT", "")
+    if symbol in SKIP:
+        return True
+    for pat in SKIP_PATTERNS:
+        if pat in base:
+            return True
+    # ML auto-blacklist — learns from trade history automatically
+    ml_bl = _get_ml_blacklist()
+    if base in ml_bl:
+        return True
+    return False
 
 
 async def _get(client, url):
@@ -619,9 +666,8 @@ async def get_all_pairs(client):
     for t in data:
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"): continue
-        if sym in SKIP: continue
-        # FIX: skip meme/junk coin patterns
-        if any(pat in sym for pat in SKIP_PATTERNS): continue
+        # Static + ML-learned blacklist (auto-updates after every trade)
+        if _should_skip(sym): continue
         vol   = float(t.get("quoteVolume", 0))
         price = float(t.get("lastPrice", 0))
         if vol < MIN_VOL or vol > MAX_VOL: continue  # FIX: $5M min
